@@ -6,7 +6,7 @@ Naxus 的 Cargo 客户端。`cargo naxus publish --workspace --atomic` 通过 Ca
 
 支持 `build`、`check`、`test`、`run`、`update`、`publish` 和 `install`。默认保持已选 SemVer 并刷新内容；`--locked` 保持双锁固定修订，`--offline --locked` 要求已有完整缓存。`Cargo.lock` 和 `naxus.lock` 应一同提交，持久日志负责两文件间的恢复。
 
-`install` 是发布到 Naxus 的兼容入口，与 `publish` 使用相同流程，不安装本机可执行程序。完整命令与模式见[客户端说明](https://github.com/nasa-runtime/naxus/blob/main/docs/client.md)。
+`install` 是发布到 Naxus 的兼容入口，与 `publish` 使用相同流程，不安装本机可执行程序。完整命令与模式见[客户端说明](https://github.com/nasa-runtime/naxus/blob/release/docs/client.md)。
 
 私有依赖须显式指定 Naxus registry。公开 registry 由服务映射代理；path 依赖仅支持同一工作区成员。不支持 Git 依赖、`[patch]`、`[replace]` 或 Cargo 配置 include。发布在独立源码副本中进行，不更改业务 manifest 和锁文件。网络、来源或校验失败不提交半完成双锁。
 
@@ -16,4 +16,4 @@ Naxus 的 Cargo 客户端。`cargo naxus publish --workspace --atomic` 通过 Ca
 
 HTTP 413 表示上传或批次超过固定大小边界，重试原输入不能解除限制。客户端保留原发布日志并提示先执行 `cargo naxus publish --abort-pending`，明确结束旧意图后缩小输入再发布；不自动丢弃已有制品或换键重发。资源配额耗尽的 429 保留独立分类。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/cargo-naxus/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/cargo-naxus/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-naxus/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-naxus/LICENSE-APACHE)。

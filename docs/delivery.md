@@ -2,7 +2,7 @@
 
 ## 源码仓库
 
-公开入口为 `https://github.com/nasa-runtime/naxus`，默认分支 `main`。源码包含服务、两个客户端、库组件、双许可证、YAML 和部署文档；令牌、数据根、日志和本机运行材料不进入仓库。
+公开入口为 `https://github.com/nasa-runtime/naxus`，默认分支 `release`。开发提交进入 `master`，发布时合并到 `release` 并创建对应产品标签；当前产品版本与源码标签均为 `1.0.0`。源码包含服务、两个客户端、库组件、双许可证、YAML 和部署文档；令牌、数据根、日志和本机运行材料不进入仓库。
 
 ```sh
 git clone https://github.com/nasa-runtime/naxus.git
@@ -16,7 +16,7 @@ GitHub 仓库公开源码不等于上传 crates.io 或 Docker Hub；这些入口
 
 ## 构建产物
 
-源码使用 Cargo workspace，服务与两个客户端在同一提交构建。GitHub Actions 的 Rust workflow 支持 push、pull request 和手动运行，覆盖 Linux/macOS、最低 Rust 1.97 和 stable。默认分支的 push 或手动运行还生成 Linux amd64、arm64 二进制归档及对应服务镜像归档。
+源码使用 Cargo workspace，服务与两个客户端在同一提交构建。GitHub Actions 的 Rust workflow 支持 master/release 分支 push、pull request 和手动运行，覆盖 Linux/macOS、最低 Rust 1.97 和 stable。默认分支的 push 或手动运行还生成 Linux amd64、arm64 二进制归档及对应服务镜像归档；产品标签绑定已合并的提交，不单独重复触发构建。
 
 二进制归档包含 `naxus`、`cargo-naxus`、`cargo-credential-naxus`、许可证、README、配置与部署文档，并提供 SHA256SUMS。直接使用归档中的可执行文件时不需要重新编译；运行 Cargo 子命令的客户端仍需要本机安装 Cargo 1.97 或更新版本。服务镜像只包含服务运行内容，不包含 Rust 工具链或开发账号。
 

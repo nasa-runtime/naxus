@@ -40,4 +40,4 @@ Admin 变更入口接收完整 `AccessIdentity`，在同一数据库事务内复
 
 发布批次的固定条目数或元数据大小超限返回 `PublishBatchTooLarge`，调用方需要缩小发布意图。受管资源配额耗尽返回 `ResourceLimitExceeded`；协议层根据错误类型分类，不解析本地诊断文字。批次拒绝不改变此前已接受条目和 HEAD。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-store/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-store/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-store/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-store/LICENSE-APACHE)。

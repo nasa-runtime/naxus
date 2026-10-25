@@ -10,4 +10,4 @@
 
 `PublishMetadata::validate_archive` 核对 Cargo 原生发布 JSON 与归档中的名称、版本、依赖别名及来源、feature、links 和 MSRV，不让自报元数据替代归档语义。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-registry/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-registry/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-registry/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-registry/LICENSE-APACHE)。

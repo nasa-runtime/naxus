@@ -13,9 +13,9 @@ include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
 
 [dependencies]
 anyhow.workspace = true
-naxus-client = { version = "0.1.0", path = "../naxus-client" }
-naxus-core = { version = "0.1.0", path = "../naxus-core" }
-naxus-registry = { version = "0.1.0", path = "../naxus-registry" }
+naxus-client = { version = "1.0.0", path = "../naxus-client" }
+naxus-core = { version = "1.0.0", path = "../naxus-core" }
+naxus-registry = { version = "1.0.0", path = "../naxus-registry" }
 reqwest.workspace = true
 semver.workspace = true
 serde.workspace = true

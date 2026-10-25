@@ -6,7 +6,7 @@ NASA Application 管理的常驻 Cargo 仓库服务。唯一 listener 承载 spa
 
 公开来源按配置顺序回源，保存原始索引和校验包体。固定 session、条件请求、同源镜像视图、DNS/重定向门禁与独立并发预算限制来源混淆及回源放大。当前只支持公开且无需认证的 HTTP sparse 上游。
 
-索引、下载配置及包体共用回源结果分类：404、网络可用性失败及 5xx 允许切换；401/403、TLS 与完整性失败停止。429 按 Retry-After 进入该配置上游的有界冷却，期间立即跳过，不阻塞业务任务。每上游事件、切换原因和剩余冷却通过统一指标出口观测；具体配置和稳定错误码见[配置说明](https://github.com/nasa-runtime/naxus/blob/main/docs/configuration.md)。
+索引、下载配置及包体共用回源结果分类：404、网络可用性失败及 5xx 允许切换；401/403、TLS 与完整性失败停止。429 按 Retry-After 进入该配置上游的有界冷却，期间立即跳过，不阻塞业务任务。每上游事件、切换原因和剩余冷却通过统一指标出口观测；具体配置和稳定错误码见[配置说明](https://github.com/nasa-runtime/naxus/blob/release/docs/configuration.md)。
 
 Admin 负责账号、强制首次换密、仓库范围、读取/发布 token、撤销、审计、包历史、逻辑管理和持久清除。Cookie 不等同于 Cargo token，写请求要求 Origin 与 CSRF；物理清除只由有权限管理主体受理。远程使用 managed 认证及 HTTPS 反向代理，无认证模式仅允许回环部署。
 
@@ -16,4 +16,4 @@ Admin 的非法名称、版本、游标和能力组合返回 400，超出账户�
 
 日志为 `${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}`，默认原生数据根 `~/.naxus/repository`。Admin 和 registry 共用 `server.port`。组件不提供多节点写入、企业 SSO、Git index 代理或服务端执行归档代码。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-server/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-server/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-server/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-server/LICENSE-APACHE)。
