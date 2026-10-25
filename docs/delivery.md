@@ -46,7 +46,9 @@ Docker Hub 需预先建立公开的 `<namespace>/naxus` 仓库。发布 token �
 
 在默认分支运行成功的 Rust workflow 中，取得 run ID，以及步骤摘要中的 amd64、arm64 **config digest**。它们与 manifest digest、manifest list digest 表达不同内容，不能互换。
 
-手动运行 Publish Docker image workflow，输入该 run ID 和两个 `sha256:` config digest。流程要求构建事件可信、构建已成功、源码 SHA 等于本次发布 SHA 和默认分支远端 SHA；只加载该次归档，不重新编译。随后核对镜像层与运行配置，将两个平台原样上传并生成版本清单。发布使用 GitHub Actions 的仓库令牌读取构建归档，使用 Docker Hub Token 上传镜像和更新概述，无需额外安装 GitHub App。
+手动运行 Publish Docker image workflow，输入该 run ID 和两个 `sha256:` config digest。流程要求构建事件可信、构建已成功、工作流提交等于默认分支远端提交，并将镜像身份绑定到该次成功构建的源码 SHA；只加载该次归档，不重新编译。随后核对镜像层与运行配置，将两个平台原样上传并生成版本清单。
+
+如果源码与当前工作流提交不同，仅允许祖先提交之后的 `.github/workflows/docker-publish.yml` 和 `docs/delivery.md` 差异；任意产品输入变化都要求重新构建。镜像标签、OCI revision 和概述中的源码链接始终使用原始构建提交。发布使用 GitHub Actions 的仓库令牌读取构建归档，使用 Docker Hub Token 上传镜像和更新概述，无需额外安装 GitHub App。
 
 已存在的版本只能继续完成相同内容的交付，不能用不同配置摘要替换。流程更新并回读 Docker Hub 中英文概述，复验远端两平台配置摘要后才指向 latest，再确认 latest 与版本清单字节一致。部署者应固定版本或内容摘要，避免把 latest 当作可复现入口。
 
