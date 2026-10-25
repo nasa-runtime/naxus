@@ -1,6 +1,6 @@
 services:
   naxus:
-    image: ${NAXUS_IMAGE:?Set NAXUS_IMAGE to your Naxus image reference}
+    image: ${NAXUS_IMAGE:-nasaruntime/naxus:1.0.0}
     container_name: naxus
     restart: unless-stopped
     ports:
@@ -13,6 +13,11 @@ services:
       - naxus-logs:/usr/local/logs/naxus
     stop_grace_period: 75s
     init: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   naxus-data:
