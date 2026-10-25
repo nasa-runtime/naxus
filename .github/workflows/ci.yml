@@ -1,0 +1,153 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Static checks and source packaging
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: ["1.97.0", stable]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt --component clippy
+      - name: Format
+        run: cargo +${{ matrix.toolchain }} fmt --all --check
+      - name: Lint
+        run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo +${{ matrix.toolchain }} build --workspace --locked
+      - name: Documentation
+        run: cargo +${{ matrix.toolchain }} doc --workspace --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Source archives
+        run: cargo +${{ matrix.toolchain }} package --workspace --registry crates-io --locked
+
+  image:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.event_name != 'pull_request'
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Rust
+        run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Build delivery binaries
+        run: cargo +1.97.0 build --workspace --release --locked
+      - name: Prepare binary archive
+        id: package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, shutil, tarfile, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
+          name = f'naxus-{version}-linux-{os.environ["ARCH"]}'
+          staging = pathlib.Path('dist')
+          staging.mkdir()
+          delivery = staging / name
+          delivery.mkdir()
+          for binary in ['naxus', 'cargo-naxus', 'cargo-credential-naxus']:
+              shutil.copy2(pathlib.Path('target/release') / binary, delivery / binary)
+          for name in ['README.md', 'README.en.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'SECURITY.md', 'CONTRIBUTING.md']:
+              shutil.copy2(name, delivery / name)
+          shutil.copytree('zcf', delivery / 'zcf')
+          shutil.copytree('docs', delivery / 'docs')
+          shutil.copytree('docker', delivery / 'docker')
+          shutil.copytree('deploy', delivery / 'deploy')
+          for component in pathlib.Path('crates').iterdir():
+              if component.joinpath('README.md').is_file():
+                  target = delivery / component
+                  target.mkdir(parents=True)
+                  for file in ['README.md', 'LICENSE-MIT', 'LICENSE-APACHE']:
+                      shutil.copy2(component / file, target / file)
+          shutil.copy2(delivery / 'naxus', staging / 'naxus')
+          archive = staging / f'{delivery.name}.tar.gz'
+          with tarfile.open(archive, 'w:gz') as output:
+              output.add(delivery, arcname=delivery.name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (staging / 'SHA256SUMS').write_text(f'{digest}  {archive.name}\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Build exact binary image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: docker/Dockerfile.artifact
+          platforms: linux/${{ matrix.arch }}
+          tags: naxus:build-${{ github.sha }}-${{ matrix.arch }}
+          build-args: |
+            NAXUS_VERSION=${{ steps.package.outputs.version }}
+            NAXUS_REVISION=${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/naxus-${{ matrix.arch }}.tar
+          cache-from: type=gha,scope=naxus-${{ matrix.arch }}
+          cache-to: type=gha,scope=naxus-${{ matrix.arch }},mode=max
+          provenance: false
+      - name: Verify image identity and binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARCHIVE: ${{ runner.temp }}/naxus-${{ matrix.arch }}.tar
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, tarfile
+          tag = f'naxus:build-{os.environ["GITHUB_SHA"]}-{os.environ["ARCH"]}'
+          with tarfile.open(os.environ['ARCHIVE']) as source:
+              entries = json.load(source.extractfile('manifest.json'))
+              assert len(entries) == 1 and entries[0]['RepoTags'] == [tag]
+              raw = source.extractfile(entries[0]['Config']).read()
+              digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+          subprocess.run(['docker', 'load', '--input', os.environ['ARCHIVE']], check=True)
+          image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', tag]))[0]
+          assert image['Architecture'] == os.environ['ARCH'] and image['Os'] == 'linux'
+          assert image['Config']['User'] == '10001:10001'
+          assert image['Config']['Labels']['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA']
+          assert image['Config']['Labels']['org.opencontainers.image.version'] == os.environ['VERSION']
+          container = subprocess.check_output(['docker', 'create', tag, '--version'], text=True).strip()
+          try:
+              subprocess.run(['docker', 'cp', f'{container}:/usr/local/bin/naxus', 'dist/naxus.from-image'], check=True)
+              assert pathlib.Path('dist/naxus.from-image').read_bytes() == pathlib.Path('dist/naxus').read_bytes()
+          finally:
+              subprocess.run(['docker', 'rm', '--volumes', container], check=True)
+          assert subprocess.check_output(['docker', 'run', '--rm', tag, '--version'], text=True).strip() == f'naxus {os.environ["VERSION"]}'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write(f'Validated {os.environ["ARCH"]} image config: `{digest}`\n')
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/naxus-${{ matrix.arch }}.tar
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: binaries-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error

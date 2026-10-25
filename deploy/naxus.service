@@ -1,0 +1,28 @@
+[Unit]
+Description=Naxus Rust artifact repository
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=naxus
+Group=naxus
+WorkingDirectory=/opt/naxus
+ExecStart=/opt/naxus/naxus serve --config /etc/naxus/application.yml
+Environment=NAXUS_DATA_PATH=/var/lib/naxus
+Environment=NAXUS_LOG_PATH=/usr/local/logs/naxus
+Environment=NAXUS_AUTH_MODE=managed
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=75s
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/naxus /usr/local/logs/naxus
+
+[Install]
+WantedBy=multi-user.target

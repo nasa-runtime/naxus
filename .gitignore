@@ -1,0 +1,12 @@
+/target/
+/dist/
+/tests/
+/logs/
+/deploy-local/
+/.naxus/
+/.idea/
+/.claude/
+.env
+.env.*
+*.secret
+.DS_Store

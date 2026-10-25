@@ -1,0 +1,239 @@
+name: Publish Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      behavior_check_run_id:
+        description: Independent successful behavior Check Run for this source and both image config digests
+        required: true
+        type: string
+      build_run_id:
+        description: Successful release Rust workflow run containing the image archives
+        required: true
+        type: string
+      amd64_config_digest:
+        description: Validated amd64 archive config digest including sha256 prefix
+        required: true
+        type: string
+      arm64_config_digest:
+        description: Validated arm64 archive config digest including sha256 prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+
+concurrency:
+  group: dockerhub-naxus
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_BRANCH: ${{ github.event.repository.default_branch }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      AMD64_CONFIG_DIGEST: ${{ inputs.amd64_config_digest }}
+      ARM64_CONFIG_DIGEST: ${{ inputs.arm64_config_digest }}
+      BEHAVIOR_CHECK_RUN_ID: ${{ inputs.behavior_check_run_id }}
+      BEHAVIOR_CHECK_APP_ID: ${{ vars.BEHAVIOR_CHECK_APP_ID }}
+      HUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify source and completed build
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, tomllib
+          from pathlib import Path
+          run_id = os.environ['BUILD_RUN_ID']
+          assert re.fullmatch(r'[0-9]+', run_id), 'Invalid build run ID'
+          for name in ['AMD64_CONFIG_DIGEST', 'ARM64_CONFIG_DIGEST']:
+              assert re.fullmatch(r'sha256:[a-f0-9]{64}', os.environ[name]), 'Invalid config digest'
+          repo, sha = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA']
+          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/actions/runs/{run_id}']))
+          assert run['head_sha'] == sha and run['head_branch'] == os.environ['RELEASE_BRANCH'], 'Source revision differs'
+          assert run['event'] in ['push', 'workflow_dispatch'], 'Untrusted build event'
+          assert run['path'] == '.github/workflows/ci.yml', 'Unexpected build workflow'
+          assert run['status'] == 'completed' and run['conclusion'] == 'success', 'Build is not successful'
+          for branch in [os.environ['RELEASE_BRANCH']]:
+              ref = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/git/ref/heads/{branch}']))
+              assert ref['object']['sha'] == sha, f'{branch} has a different revision'
+          with open('Cargo.toml', 'rb') as manifest:
+              version = tomllib.load(manifest)['workspace']['package']['version']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version), 'Stable version required'
+          namespace = os.environ['HUB_NAMESPACE']
+          assert re.fullmatch(r'[a-z0-9][a-z0-9_-]*', namespace), 'Invalid Docker Hub namespace'
+          assert Path('docker/README.md').is_file(), 'Docker Hub overview is required'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'IMAGE={namespace}/naxus\nVERSION={version}\n')
+          PY
+      - name: Download image archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          pattern: image-*
+          merge-multiple: true
+          path: image-archives
+      - name: Verify independent behavior acceptance
+        run: python3 .github/scripts/verify-behavior-acceptance.py
+      - name: Verify exact image identities
+        run: |
+          python3 - <<'PYIDENTITY'
+          import hashlib, json, os, subprocess, tarfile
+          for arch in ['amd64', 'arm64']:
+              archive = f'image-archives/naxus-{arch}.tar'
+              tag = f'naxus:build-{os.environ["GITHUB_SHA"]}-{arch}'
+              # 配置摘要绑定运行参数与全部文件系统层，不依赖 Docker 存储后端的 ID 表示。
+              with tarfile.open(archive) as source:
+                  entries = json.load(source.extractfile('manifest.json'))
+                  assert len(entries) == 1 and entries[0]['RepoTags'] == [tag], 'Unexpected archive tags'
+                  raw = source.extractfile(entries[0]['Config']).read()
+                  assert 'sha256:' + hashlib.sha256(raw).hexdigest() == os.environ[f'{arch.upper()}_CONFIG_DIGEST'], 'Archive differs from validated artifact'
+                  config = json.loads(raw)
+              subprocess.run(['docker', 'load', '--input', archive], check=True)
+              image = json.loads(subprocess.check_output(['docker', 'image', 'inspect', tag]))[0]
+              assert image['RootFS']['Type'] == config['rootfs']['type'] and image['RootFS']['Layers'] == config['rootfs']['diff_ids'], 'Loaded image layers differ'
+              for field in ['User', 'Env', 'Entrypoint', 'Cmd', 'WorkingDir', 'Labels', 'StopSignal', 'ExposedPorts', 'Healthcheck', 'Volumes']:
+                  assert image['Config'].get(field) == config['config'].get(field), f'Loaded image {field} differs'
+              assert image['Architecture'] == arch and image['Os'] == 'linux', 'Unexpected image platform'
+              assert config['architecture'] == arch and config['os'] == 'linux', 'Unexpected archive platform'
+              assert image['Config']['User'] == '10001:10001', 'Unexpected runtime identity'
+              assert image['Config']['Entrypoint'] == ['/usr/local/bin/naxus'], 'Unexpected entrypoint'
+              labels = image['Config']['Labels']
+              assert labels['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA'], 'Unexpected source'
+              assert labels['org.opencontainers.image.version'] == os.environ['VERSION'], 'Unexpected version'
+          PYIDENTITY
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+      - name: Sign in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Verify registry version ownership
+        run: |
+          python3 - <<'PYREGISTRY'
+          import json, os, urllib.error, urllib.parse, urllib.request
+          image = os.environ['IMAGE']
+          query = urllib.parse.urlencode({'service': 'registry.docker.io', 'scope': f'repository:{image}:pull'})
+          with urllib.request.urlopen(f'https://auth.docker.io/token?{query}', timeout=30) as response:
+              token = json.load(response)['token']
+          def manifest(reference):
+              """业务作用：读取远端镜像身份，区分不存在与无法确认。
+              参数说明：
+              - reference：待核对的标签或内容摘要。
+              返回：存在时返回清单，仅 HTTP 404 返回 None，其余失败停止发布。
+              """
+              request = urllib.request.Request(
+                  f'https://registry-1.docker.io/v2/{image}/manifests/{reference}',
+                  headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise SystemExit(f'Registry preflight failed: HTTP {error.code}')
+          expected = {arch: os.environ[f'{arch.upper()}_CONFIG_DIGEST'] for arch in ['amd64', 'arm64']}
+          version = manifest(os.environ['VERSION'])
+          if version is not None:
+              # 已存在的内容只能用于继续完成同一发布，不能替换已公开版本。
+              entries = version.get('manifests', [])
+              assert sorted((entry['platform']['os'], entry['platform']['architecture']) for entry in entries) == [('linux', 'amd64'), ('linux', 'arm64')], 'Existing version platforms differ'
+              for entry in entries:
+                  arch = entry['platform']['architecture']
+                  assert manifest(entry['digest'])['config']['digest'] == expected[arch], 'Existing version content differs; choose a new version'
+          for arch in expected:
+              existing = manifest(f'sha-{os.environ["GITHUB_SHA"]}-{arch}')
+              assert existing is None or existing['config']['digest'] == expected[arch], 'Existing architecture image differs'
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'PUBLISH_VERSION={"true" if version is None else "false"}\n')
+          PYREGISTRY
+      - name: Upload exact images and version manifest
+        if: env.PUBLISH_VERSION == 'true'
+        run: |
+          for arch in amd64 arm64; do
+            source="naxus:build-${GITHUB_SHA}-${arch}"
+            target="${IMAGE}:sha-${GITHUB_SHA}-${arch}"
+            docker tag "$source" "$target"
+            docker push "$target"
+          done
+          docker buildx imagetools create --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:sha-${GITHUB_SHA}-amd64" "${IMAGE}:sha-${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}" > version-manifest.json
+          python3 - <<'PY'
+          import json
+          with open('version-manifest.json') as source:
+              manifests = json.load(source)['manifests']
+          assert sorted((item['platform']['os'], item['platform']['architecture']) for item in manifests) == [('linux', 'amd64'), ('linux', 'arm64')]
+          PY
+      - name: Publish repository overview
+        env:
+          HUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          credentials = {'identifier': os.environ['HUB_USERNAME'], 'secret': os.environ['HUB_TOKEN']}
+          request = urllib.request.Request('https://hub.docker.com/v2/auth/token', data=json.dumps(credentials).encode(), headers={'Content-Type': 'application/json'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)['access_token']
+          print(f'::add-mask::{token}')
+          overview = Path('docker/README.md').read_text()
+          import re
+          base = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/blob/{os.environ["GITHUB_SHA"]}/'
+          overview = re.sub(r'\]\(\.\./([^)]*)\)', lambda match: '](' + base + match.group(1) + ')', overview)
+          description = 'Rust artifact repository with same-version development refresh, immutable snapshots and public registry caching.'
+          url = f'https://hub.docker.com/v2/repositories/{os.environ["IMAGE"]}/'
+          request = urllib.request.Request(url, data=json.dumps({'description': description, 'full_description': overview}).encode(), headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}, method='PATCH')
+          with urllib.request.urlopen(request, timeout=30):
+              pass
+          request = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.load(response)
+          assert result['full_description'] == overview, 'Docker Hub overview differs'
+          assert result['description'] == description, 'Docker Hub summary differs'
+          PY
+      - name: Update latest to the published version
+        run: |
+          python3 - <<'PYVERIFY'
+          import hashlib, json, os, subprocess, urllib.parse, urllib.request
+          image = os.environ['IMAGE']
+          query = urllib.parse.urlencode({'service': 'registry.docker.io', 'scope': f'repository:{image}:pull'})
+          with urllib.request.urlopen(f'https://auth.docker.io/token?{query}', timeout=30) as response:
+              token = json.load(response)['token']
+          def read_manifest(reference):
+              """业务作用：回读已上传内容，验证标签、清单摘要和平台对应配置。
+              参数说明：
+              - reference：本次发布的标签或清单摘要。
+              返回：摘要经校验的原始内容与清单，无法确认时停止交付。
+              """
+              request = urllib.request.Request(
+                  f'https://registry-1.docker.io/v2/{image}/manifests/{reference}',
+                  headers={'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  raw = response.read()
+                  digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+                  assert response.headers['Docker-Content-Digest'] == digest, 'Registry content digest differs'
+                  if reference.startswith('sha256:'):
+                      assert reference == digest, 'Registry manifest differs from requested digest'
+                  return raw, json.loads(raw)
+          version_raw, version = read_manifest(os.environ['VERSION'])
+          entries = version['manifests']
+          assert sorted((entry['platform']['os'], entry['platform']['architecture']) for entry in entries) == [('linux', 'amd64'), ('linux', 'arm64')], 'Unexpected platform list'
+          for entry in entries:
+              arch = entry['platform']['architecture']
+              _, manifest = read_manifest(entry['digest'])
+              assert manifest['config']['digest'] == os.environ[f'{arch.upper()}_CONFIG_DIGEST'], 'Published architecture differs from validated archive'
+          subprocess.run(['docker', 'buildx', 'imagetools', 'create', '--tag', f'{image}:latest', f'{image}:{os.environ["VERSION"]}'], check=True)
+          latest_raw, latest = read_manifest('latest')
+          assert latest_raw == version_raw, 'Latest does not identify the validated version'
+          PYVERIFY
+          printf 'Image: %s:%s\nSource: %s\n' "$IMAGE" "$VERSION" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

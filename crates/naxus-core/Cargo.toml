@@ -1,0 +1,27 @@
+[package]
+name = "naxus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Artifact identities and immutable snapshots for same-version Cargo publishing"
+keywords = ["cargo", "registry", "artifacts", "snapshots"]
+categories = ["development-tools"]
+readme = "README.md"
+publish = true
+autotests = false
+include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
+
+[dependencies]
+anyhow.workspace = true
+cargo-platform.workspace = true
+hex.workspace = true
+libc.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+unicode-ident.workspace = true
+url.workspace = true
+uuid.workspace = true

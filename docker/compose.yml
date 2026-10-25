@@ -1,0 +1,19 @@
+services:
+  naxus:
+    image: ${NAXUS_IMAGE:?Set NAXUS_IMAGE to your Naxus image reference}
+    container_name: naxus
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7443:7443"
+    environment:
+      NAXUS_PUBLIC_URL: ${NAXUS_PUBLIC_URL:-http://127.0.0.1:7443}
+      NAXUS_AUTH_MODE: managed
+    volumes:
+      - naxus-data:/var/lib/naxus
+      - naxus-logs:/usr/local/logs/naxus
+    stop_grace_period: 75s
+    init: false
+
+volumes:
+  naxus-data:
+  naxus-logs:

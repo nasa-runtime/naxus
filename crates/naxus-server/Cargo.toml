@@ -1,0 +1,38 @@
+[package]
+name = "naxus-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cargo repository service with same-version revisions, public registry caching and Admin"
+keywords = ["cargo", "registry", "server", "artifacts", "proxy"]
+categories = ["development-tools", "web-programming::http-server"]
+readme = "README.md"
+publish = true
+autotests = false
+include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+httpdate.workspace = true
+hyper.workspace = true
+nasa.workspace = true
+naxus-core = { version = "0.1.0", path = "../naxus-core" }
+naxus-store = { version = "0.1.0", path = "../naxus-store" }
+naxus-registry = { version = "0.1.0", path = "../naxus-registry" }
+reqwest.workspace = true
+rustls.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true

@@ -1,0 +1,32 @@
+application:
+  name: naxus
+  mode: service
+  startup_timeout_ms: 30000
+  shutdown_timeout_ms: 60000
+
+log:
+  level: ${NAXUS_LOG_LEVEL:info}
+  path: ${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}
+  max_file_size: 100MB
+  total_size_cap: 1GB
+  max_history_days: 7
+  clean_history_on_start: true
+  split_error_file: true
+  color: false
+
+server:
+  host: ${NAXUS_HOST:127.0.0.1}
+  port: ${NAXUS_PORT:7443}
+  health: true
+  request_body_limit_bytes: 268435456
+  graceful_shutdown_timeout_ms: 30000
+
+naxus:
+  public_base_url: ${NAXUS_PUBLIC_URL:http://127.0.0.1:7443}
+  data:
+    root: ${NAXUS_DATA_PATH:}
+  auth:
+    mode: ${NAXUS_AUTH_MODE:${NAXUS_ACCESS_MODE:none}}
+  repositories:
+    - name: team-dev
+      policy: mutable

@@ -1,0 +1,24 @@
+[package]
+name = "naxus-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded Cargo crate inspection and immutable sparse index metadata"
+keywords = ["cargo", "registry", "archives", "validation"]
+categories = ["development-tools"]
+readme = "README.md"
+publish = true
+autotests = false
+include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
+
+[dependencies]
+anyhow.workspace = true
+flate2.workspace = true
+naxus-core = { version = "0.1.0", path = "../naxus-core" }
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+tar.workspace = true
+toml.workspace = true

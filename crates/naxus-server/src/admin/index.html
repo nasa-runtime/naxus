@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Naxus · 仓库管理</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <aside>
+      <a class="brand" href="./"
+        ><span class="mark">N</span
+        ><span>Naxus<small>ARTIFACT REPOSITORY</small></span></a
+      >
+      <nav id="navigation" aria-label="管理导航"></nav>
+      <div class="sidebar-foot">
+        Rust 制品，统一入口。<br />Hosted · Proxy · Snapshots
+      </div>
+    </aside>
+    <main>
+      <header>
+        <span class="eyebrow">REPOSITORY CONSOLE</span>
+        <div id="account"></div>
+      </header>
+      <div id="notice" role="status" aria-live="polite"></div>
+      <section id="content" aria-label="管理内容">
+        <h1>正在连接仓库</h1>
+      </section>
+      <footer>管理员与 Cargo registry 共用当前服务端口。</footer>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,71 @@
+[workspace]
+members = [
+    "crates/naxus-core",
+    "crates/naxus-store",
+    "crates/naxus-registry",
+    "crates/naxus-server",
+    "crates/naxus-client",
+    "crates/cargo-naxus",
+    "crates/cargo-credential-naxus",
+]
+resolver = "2"
+
+[package]
+name = "naxus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust artifact repository with same-version publishing, immutable snapshots and public registry caching"
+readme = "README.md"
+publish = false
+autotests = false
+include = ["/Cargo.toml", "/Cargo.lock", "/rustfmt.toml", "/README*.md", "/LICENSE-*", "/SECURITY.md", "/CONTRIBUTING.md", "/src/**", "/zcf/**", "/docs/**", "/docker/**", "/deploy/**", "/.dockerignore"]
+
+[dependencies]
+anyhow.workspace = true
+nasa.workspace = true
+naxus-server = { version = "0.1.0", path = "crates/naxus-server" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nasa-runtime/naxus"
+
+[workspace.dependencies]
+anyhow = "1"
+cargo-platform = "=0.3.3"
+axum = "0.8"
+futures-util = "0.3"
+fs2 = "0.4"
+flate2 = "1"
+hex = "0.4"
+httpdate = "1"
+hyper = "1"
+libc = "0.2"
+nasa = { version = "=2.0.5", features = ["application", "web-auth", "yml", "log", "secret", "crypto"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+sha2 = "0.10"
+tar = "0.4.46"
+toml = "1"
+tokio = { version = "1", features = ["fs", "io-util", "net", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
+tracing = "0.1"
+unicode-ident = "1"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1", features = ["serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

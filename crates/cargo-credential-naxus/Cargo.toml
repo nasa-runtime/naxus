@@ -1,0 +1,17 @@
+[package]
+name = "cargo-credential-naxus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cargo credential provider for stable Naxus project identities"
+readme = "README.md"
+publish = false
+autotests = false
+include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
+
+[dependencies]
+anyhow.workspace = true
+naxus-client = { version = "0.1.0", path = "../naxus-client" }
+serde_json.workspace = true

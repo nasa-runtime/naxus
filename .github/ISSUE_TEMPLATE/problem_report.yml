@@ -1,0 +1,22 @@
+name: 使用问题
+description: 描述可重现的行为、预期结果和运行环境。
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 实际行为与预期结果
+      description: 请勿填写凭据、私有包内容或原始数据库。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 最小重现步骤
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 操作系统、Rust/Cargo 版本和组件版本
+    validations:
+      required: true

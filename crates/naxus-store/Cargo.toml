@@ -1,0 +1,27 @@
+[package]
+name = "naxus-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transactional Cargo snapshots, durable artifacts and same-version revisions on SQLite"
+keywords = ["cargo", "registry", "sqlite", "artifacts", "snapshots"]
+categories = ["database", "development-tools"]
+readme = "README.md"
+publish = true
+autotests = false
+include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**", "/migrations/**"]
+
+[dependencies]
+anyhow.workspace = true
+fs2.workspace = true
+hex.workspace = true
+libc.workspace = true
+naxus-core = { version = "0.1.0", path = "../naxus-core" }
+rusqlite.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
