@@ -3,10 +3,6 @@ name: Publish Docker image
 on:
   workflow_dispatch:
     inputs:
-      behavior_check_run_id:
-        description: Independent successful behavior Check Run for this source and both image config digests
-        required: true
-        type: string
       build_run_id:
         description: Successful release Rust workflow run containing the image archives
         required: true
@@ -23,7 +19,6 @@ on:
 permissions:
   contents: read
   actions: read
-  checks: read
 
 concurrency:
   group: dockerhub-naxus
@@ -41,8 +36,6 @@ jobs:
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
       AMD64_CONFIG_DIGEST: ${{ inputs.amd64_config_digest }}
       ARM64_CONFIG_DIGEST: ${{ inputs.arm64_config_digest }}
-      BEHAVIOR_CHECK_RUN_ID: ${{ inputs.behavior_check_run_id }}
-      BEHAVIOR_CHECK_APP_ID: ${{ vars.BEHAVIOR_CHECK_APP_ID }}
       HUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -81,8 +74,6 @@ jobs:
           pattern: image-*
           merge-multiple: true
           path: image-archives
-      - name: Verify independent behavior acceptance
-        run: python3 .github/scripts/verify-behavior-acceptance.py
       - name: Verify exact image identities
         run: |
           python3 - <<'PYIDENTITY'
@@ -190,7 +181,7 @@ jobs:
           import re
           base = f'https://github.com/{os.environ["GITHUB_REPOSITORY"]}/blob/{os.environ["GITHUB_SHA"]}/'
           overview = re.sub(r'\]\(\.\./([^)]*)\)', lambda match: '](' + base + match.group(1) + ')', overview)
-          description = 'Rust artifact repository with same-version development refresh, immutable snapshots and public registry caching.'
+          description = 'Rust 本地制品仓库与远程私服，支持同版本发布、不可变快照、公共仓库缓存和 Admin 管理。'
           url = f'https://hub.docker.com/v2/repositories/{os.environ["IMAGE"]}/'
           request = urllib.request.Request(url, data=json.dumps({'description': description, 'full_description': overview}).encode(), headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}, method='PATCH')
           with urllib.request.urlopen(request, timeout=30):

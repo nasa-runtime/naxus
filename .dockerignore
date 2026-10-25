@@ -14,6 +14,7 @@
 !docker
 !docker/Dockerfile
 !docker/Dockerfile.artifact
+!docker/runtime-rootfs.sh
 !dist
 !dist/**
 **/.DS_Store

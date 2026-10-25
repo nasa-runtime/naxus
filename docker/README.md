@@ -1,112 +1,172 @@
-# Naxus 容器
+# Naxus Docker 镜像
 
-同版本可覆盖的 Rust 私服，带不可变历史快照、公开 sparse registry 缓存和同端口 Admin。开发人员用 `cargo naxus` 消费同版本新修订；普通 Cargo 不会自动刷新同版本内容。
+Rust 本地制品仓库与远程私服，支持同版本新修订、不可变快照、公共 sparse registry 缓存和同端口 Admin。开发机与 CI 使用配套 `cargo naxus` 客户端；镜像只运行服务，不包含 Rust 编译器或 Cargo。
 
-[English overview and client guide](../README.en.md)
+[English guide](../README.en.md)
 
-## 构建
+## 最简启动
 
-```sh
-docker build --file docker/Dockerfile --tag naxus:local .
-export NAXUS_IMAGE=naxus:local
-```
-
-源码镜像使用固定 Rust 与 Debian 基础镜像摘要。`docker/Dockerfile.artifact` 接受 `dist/naxus` 中与目标平台匹配的预构建二进制，供交付流程使用。目标平台为 Linux `amd64` 和 `arm64`；跨平台源构建需要配置 Buildx 的对应构建节点或模拟器。
-
-Docker Hub 地址和版本由发布者指定，不能把示例地址当作已有公开镜像。使用远程镜像时，将 `NAXUS_IMAGE` 设为实际的 `<namespace>/naxus:<version>`，或固定为 `<namespace>/naxus@sha256:<manifest-digest>`。服务镜像只提供 Naxus；开发机和 CI 另行安装 `cargo-naxus` 与 credential provider。
-
-## 启动和持久卷
-
-把 `NAXUS_IMAGE` 设置为实际镜像引用，然后运行：
+镜像地址为 `nasaruntime/naxus:1.0.0`。部署时使用已发布的版本标签，也可固定多架构 manifest digest。
 
 ```sh
-docker compose --file docker/compose.yml up --detach
-docker compose --file docker/compose.yml logs --follow
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  nasaruntime/naxus:1.0.0
 ```
 
-Compose 默认只把宿主 `127.0.0.1:7443` 暴露给本机或本机反向代理，使用 `restart: unless-stopped` 和 75 秒停机宽限。Docker 服务本身需配置开机启动。
-
-| 项目 | 镜像默认值 |
-| --- | --- |
-| 运行用户 | UID/GID `10001:10001` |
-| 单一服务端口 | `7443`，Admin 路径 `/admin/` |
-| 数据根 | `/var/lib/naxus` |
-| 日志根 | `/usr/local/logs/naxus` |
-| 配置 | `/opt/naxus/zcf/application.yml` |
-| 备份挂载点 | `/var/backups/naxus` |
-| Cargo 认证 | managed |
-| 停机信号 | SIGTERM |
-
-数据和日志分别使用 named volume。整个数据根必须持久保存，包括 SQLite/WAL/SHM、对象、稳定身份和清除证据；不能仅保存 objects。一个数据根只运行一个活动实例。
-
-Docker Desktop 使用 Linux 原生 named volume，宿主共享目录不能作为数据根。原生 Linux 允许受支持本地文件系统 bind mount。数据根归运行账号所有，权限为 0700；使用自定义宿主目录或 UID 时，提前配置对应所有权，只有组写权限不足以满足该合同。镜像不要求 root，也不禁止运维显式指定 `--user 0:0`；不通过启动脚本自动改变任意宿主目录所有权。
-
-日志表达式为 `${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}`。自定义日志路径必须可写。只读容器根需要为数据和日志提供可写挂载；健康检查仅查询就绪状态，不写入制品。
-
-单容器也可以直接使用只读根运行，数据和日志保存在各自可写卷中：
+打开 `http://127.0.0.1:7443/admin/`。首次启动的用户名为 `admin`，查看一次性口令：
 
 ```sh
-docker run --detach --name naxus --read-only --restart unless-stopped --stop-timeout 75 --publish 127.0.0.1:7443:7443 --volume naxus-data:/var/lib/naxus --volume naxus-logs:/usr/local/logs/naxus --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 "$NAXUS_IMAGE"
+docker exec naxus cat /var/lib/naxus/bootstrap/admin.password
 ```
 
-## 首次登录
+登录后必须换密，临时口令文件随后移除；复用已有数据卷不会重置账号。创建开发用户及仓库权限，再签发客户端读取或发布 token。发布同版本新内容还需要显式覆盖权限。
 
 ```sh
-docker compose --file docker/compose.yml exec naxus cat /var/lib/naxus/bootstrap/admin.password
-```
-
-打开 `http://127.0.0.1:7443/admin/`，用户为 `admin`，使用生成的临时口令登录并设置新口令。不要将实际口令复制到公共工单或日志。换密后临时明文移除；已有数据卷重启不会重置账号。
-
-在 Admin 创建开发用户及其仓库范围，再创建读取/发布 token。通过客户端 `NAXUS_TOKEN` 或受限文件提供 token，不把它写进 Dockerfile、业务 manifest 或 Git。业务工作区接入：
-
-```sh
-cargo naxus configure --endpoint https://registry.example.com --repository team-dev
-cargo naxus publish --workspace --atomic
-cargo naxus build
-cargo naxus build --locked
-```
-
-## 远程部署
-
-设置 `NAXUS_PUBLIC_URL=https://registry.example.com`，由 HTTPS 反向代理转发到容器。业务端只接受远程 HTTPS；服务端仍由一个 listener 处理 Admin 与 Cargo。代理配置上传大小、请求期限、规范 Host/Origin，并按网络需求限制 `/admin/` 和观测路径。
-
-挂载完整自定义 YAML 可配置多个 hosted/proxy：
-
-```yaml
-volumes:
-  - ./application.yml:/opt/naxus/zcf/application.yml:ro
-```
-
-文件中日志路径仍使用统一表达式。省略 proxies 默认 crates.io；显式列表替换默认值，同一来源的镜像按顺序回源，独立 registry 不混合。配置示例见[配置文档](../docs/configuration.md)。
-
-## 清理与备份
-
-删除操作只从 Admin 发起。逻辑移除不释放空间，物理清除须通过影响预览和保护引用检查。公开缓存清除不封禁坐标，同版本和未来版本可重新回源。持久任务在页面关闭后继续，失败保留阶段并退避，可由运维重试。
-
-先停止服务，再使用同一镜像的一次性备份进程。以下卷名是示例，应替换为实际 Compose 数据卷名：
-
-```sh
-docker stop --time 75 naxus
-docker run --rm --volume naxus-data:/var/lib/naxus --volume naxus-backups:/var/backups/naxus "$NAXUS_IMAGE" backup --data-dir /var/lib/naxus --output /var/backups/naxus/saved
+docker logs -f naxus
+docker exec naxus naxus healthcheck
+docker stop naxus
 docker start naxus
 ```
 
-备份目标须不存在。备份使用 SQLite 一致备份 API、独立对象副本和摘要清单，不是复制单个运行中的数据库文件。将备份另存到安全介质；卷本身不能替代异地副本。
+默认只把端口暴露到宿主回环地址，适合本机或同宿主反向代理。服务常驻运行，`unless-stopped` 在 Docker 重启后恢复服务；Docker 自身需要配置开机启动。
 
-恢复到全新数据卷：
+## Compose
+
+源码仓库已提供默认镜像、持久卷、75 秒停机宽限和标准输出日志轮转：
 
 ```sh
-docker run --rm --volume naxus-restored:/var/lib/naxus --volume naxus-backups:/var/backups/naxus:ro "$NAXUS_IMAGE" restore --backup /var/backups/naxus/saved --data-dir /var/lib/naxus/restored
+docker compose -f docker/compose.yml up -d
+docker compose -f docker/compose.yml logs -f
 ```
 
-新服务的 `NAXUS_DATA_PATH` 指向 `/var/lib/naxus/restored`，并挂载该新卷。恢复保留 UUID、账号和历史；外部 YAML、TLS 与 secret 文件单独保管。备份包含账号散列和可能存在的引导材料，按敏感运维数据保护。
+可通过 `NAXUS_IMAGE` 选择其他已发布标签或 digest。Compose 的 `down` 保留数据；`down --volumes` 会删除 named volume，仅在明确不再需要这些数据时使用。
 
-## 健康与升级
+## 数据卷与运行身份
 
-镜像内置 `naxus healthcheck`，请求回环 `/readyz`，只在成功状态退出零。默认单制品上限 256 MiB、保留 2 GiB 空闲，低容量拒绝新写入而保留已有读取。`/metrics` 输出有限指标族，不包含 token、用户名或任意 URL 标签。
+| 内容 | 容器路径 | 挂载方式 |
+| --- | --- | --- |
+| 完整仓库数据 | `/var/lib/naxus` | named volume `naxus-data`，必须持久保存 |
+| 文件日志 | `/usr/local/logs/naxus` | named volume `naxus-logs` |
+| 默认 YAML | `/opt/naxus/zcf/application.yml` | 镜像内置，可将配置目录只读挂载到 `/opt/naxus/zcf` |
+| 备份目录 | `/var/backups/naxus` | 备份操作时挂载独立卷或受限路径 |
 
-升级前停服并保留完整备份，重新创建容器时复用数据与日志卷及相同规范 URL。新版本只允许向前迁移；旧版本不认识 schema 时拒绝打开。回退使用旧镜像及升级前备份，不直接让旧程序读取新 schema。单节点停机期间允许短暂不可用。
+数据包含 SQLite/WAL/SHM、原始对象、稳定服务/仓库 UUID、账号、快照、恢复和清除记录，不能只挂载 objects。一个数据根只允许一个活动写入者。
+
+默认 UID/GID 为 `10001:10001`，新建 named volume 自动使用镜像预置目录的所有权。数据根属于运行用户且权限为 0700；不需要以 root 启动。原生 Linux 使用自定义 bind mount 或 `--user` 时，先设置目录所有权，不能仅授予组写权限。镜像不会自行修改任意宿主路径的所有者。
+
+Docker Desktop 使用 Linux 原生 named volume，宿主共享目录不能作为数据根。Linux bind mount 需位于 ext4/XFS/Btrfs/F2FS/overlayfs；配置文件只读挂载不受数据根的该限制。只读容器根可加 `--read-only`，数据和日志卷仍需可写。
+
+## 挂载自定义 YAML 目录
+
+准备真实存在、可读取的 `/path/to/naxus-conf/application.yml`，将整个配置目录挂载到容器。数据仍使用持久卷：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  --mount type=bind,src=/path/to/naxus-conf,dst=/opt/naxus/zcf,readonly \
+  nasaruntime/naxus:1.0.0
+```
+
+完整配置以仓库的 `zcf/application.yml` 为基础；多个 hosted/proxy、认证和镜像回源示例见[配置文档](../docs/configuration.md)。日志保持：
+
+```yaml
+log:
+  path: ${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}
+```
+
+只读只限制容器写入，宿主仍可编辑文件。目录挂载允许编辑器通过原子替换保存 application.yml，容器也能看到新文件；单文件 bind mount 可能继续引用旧 inode。
+
+内置 YAML 通过占位符读取环境变量。自定义文件若把端口、路径等写成固定值，同名环境变量不会自动覆盖，须保留相应占位符。当前业务配置在启动时固定，修改目录中的 YAML 后执行 `docker restart naxus`；没有运行中热加载。环境变量属于容器创建配置，修改后需重建容器，单纯 restart 不会更新环境。
+
+Compose 可在服务的 volumes 中追加：
+
+```yaml
+- /path/to/naxus-conf:/opt/naxus/zcf:ro
+```
+
+## 环境变量与端口
+
+| 变量 | 镜像或内置 YAML 默认值 | 作用 |
+| --- | --- | --- |
+| `NAXUS_HOST` | `0.0.0.0` | 容器内监听地址 |
+| `NAXUS_PORT` | `7443` | 容器内服务端口，Admin、Cargo、健康和指标共用 |
+| `NAXUS_PUBLIC_URL` | `http://127.0.0.1:7443` | 客户端和浏览器使用的规范外部入口 |
+| `NAXUS_DATA_PATH` | `/var/lib/naxus` | 完整数据根；修改时同步调整数据卷目标 |
+| `NAXUS_LOG_PATH` | `/usr/local/logs/naxus` | 文件日志根；修改时同步调整日志卷目标 |
+| `NAXUS_LOG_LEVEL` | `info` | 日志级别 |
+| `NAXUS_AUTH_MODE` | `managed` | 账号及独立 token 认证，远程部署保持该值 |
+| `NAXUS_HEALTH_URL` | 按 NAXUS_PORT 构造回环 readyz | 自定义 YAML 固定其他端口时可显式指定健康检查入口 |
+| `TZ` | `Etc/UTC` | IANA 时区，例如 `Asia/Shanghai` |
+
+宿主端口由 `-p` 控制，与容器内监听端口分开。仅将宿主端口改为 8443 时保留容器端口，并同步规范 URL：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:8443:7443 \
+  -e NAXUS_PUBLIC_URL=http://127.0.0.1:8443 \
+  -e TZ=Asia/Shanghai \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  nasaruntime/naxus:1.0.0
+```
+
+如需把容器端口本身改为 8443，还要设置 `NAXUS_PORT=8443` 并使用 `-p 127.0.0.1:8443:8443`。只改端口映射不会改变应用监听或对外 URL。
+
+`DOCKERHUB_*` 只用于 GitHub 发布，不传给服务容器。业务 token 在 Admin 签发，客户端通过 `NAXUS_TOKEN` 或受限 token 文件提供，不写进 Dockerfile、业务 manifest 或 Git。
+
+## 远程访问
+
+设置 `NAXUS_PUBLIC_URL=https://registry.example.com`，由 HTTPS 反向代理转发到服务端口。客户端远程入口要求 HTTPS；容器内 HTTP 仍由一个 listener 处理 Admin 与 Cargo。代理配置上传大小、请求期限和规范 Origin，并按网络范围限制管理与观测路径。
+
+容器与反向代理不在同一宿主时，按实际网络设置宿主监听地址或加入相同 Docker 网络。将宿主端口开放到外网本身不提供 TLS。Admin 默认地址是规范 URL 加 `/admin/`。
+
+## 精简运行层与构建
+
+运行层从固定摘要的 Alpine 提取 CA 证书、时区和静态 BusyBox 基础命令，与静态 musl 服务程序一起装入空白镜像。镜像不包含编译工具、客户端或开发账号，也不使用可执行压缩器。保留标准退出、信号和持久化语义。
+
+从源码构建：
+
+```sh
+docker build -f docker/Dockerfile -t naxus:local .
+```
+
+`docker/Dockerfile.artifact` 使用同一运行层，接收 `dist/naxus` 中对应目标平台的静态程序。发布流程将同一构建的程序同时放入 Linux 二进制归档与服务镜像，核对两者字节身份。提供 `linux/amd64` 和 `linux/arm64`；原生架构自动选择对应镜像。
+
+## 备份与恢复
+
+先停服，再使用同一镜像运行备份；备份目标必须不存在：
+
+```sh
+docker stop naxus
+docker run --rm -v naxus-data:/var/lib/naxus -v naxus-backups:/var/backups/naxus \
+  nasaruntime/naxus:1.0.0 backup --data-dir /var/lib/naxus --output /var/backups/naxus/saved
+docker start naxus
+```
+
+备份保存 SQLite 一致视图、独立对象副本和摘要清单，不是复制运行中的数据库主文件。备份含账号散列及可能存在的引导材料，应受限存放并保留独立副本。
+
+恢复到新卷：
+
+```sh
+docker run --rm -v naxus-restored:/var/lib/naxus -v naxus-backups:/var/backups/naxus:ro \
+  nasaruntime/naxus:1.0.0 restore --backup /var/backups/naxus/saved --data-dir /var/lib/naxus/restored
+```
+
+新服务挂载 `naxus-restored:/var/lib/naxus` 并设置 `NAXUS_DATA_PATH=/var/lib/naxus/restored`。恢复保留 UUID、账号和历史；外部 YAML、TLS 和 secret 文件另行保存。Compose 的实际卷名可能带项目前缀，备份命令应使用对应卷名。
+
+升级前停服并保留完整备份，复用规范 URL 和持久卷。旧程序不认识新 schema 时拒绝打开，回退应使用旧镜像及升级前备份。单节点停机期间允许短暂不可用。
+
+## 管理与容量
+
+删除从 Admin 发起，没有删除 CLI。逻辑移除不释放字节；物理清除需要预览、明确历史撤销和保护引用检查。HEAD、保留点、有效租约与活动读者不能被强制跨过。公开缓存清理不封禁坐标，同版本和未来版本可再次回源。
+
+默认单制品上限 256 MiB、保留空闲空间 2 GiB；低容量拒绝新写入并保留已有完整对象读取。文件日志默认上限和轮转由 YAML 管理，Compose 另限制标准输出日志大小。维护、完整性和失败语义见[运维说明](../docs/operations.md)。
 
 ## Container summary
 
-Naxus supports mutable development coordinates with immutable snapshots, persistent public registry caching and a same-port Admin UI. Use the companion Cargo client for same-version refresh. The image defaults to UID/GID 10001, managed authentication, `/var/lib/naxus` data and `/usr/local/logs/naxus` logs. Persist the whole data root using a native local volume, stop gracefully, and take a consistent backup before upgrading. There is no multi-writer HA or transparent zero-downtime upgrade. See the [English overview](../README.en.md) for client behavior and limits.
+Naxus provides same-version Rust publishing, immutable snapshots, public registry caching and a same-port Admin UI. The image contains a static musl executable, CA certificates, time zones and static BusyBox tools, without a package manager or dynamic libraries. It defaults to UID/GID 10001, port 7443, managed authentication, persistent data at /var/lib/naxus and logs at /usr/local/logs/naxus. Mount the whole data root, bind custom YAML read-only, and set NAXUS_PUBLIC_URL to the client-facing HTTPS endpoint for remote use. See the [English guide](../README.en.md) for client behavior.

@@ -45,20 +45,40 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
           - arch: arm64
             runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Install Rust
-        run: rustup toolchain install 1.97.0 --profile minimal
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --target ${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build delivery binaries
-        run: cargo +1.97.0 build --workspace --release --locked
+        env:
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: z
+          CC: musl-gcc
+          RUSTFLAGS: -C linker=musl-gcc
+        run: |
+          cargo +1.97.0 build --workspace --release --target ${{ matrix.target }} --locked
+          # 最终运行层不依赖 GNU ABI，客户端归档和服务镜像都只接受无外部加载器的程序。
+          for binary in naxus cargo-naxus cargo-credential-naxus; do
+            path="target/${{ matrix.target }}/release/${binary}"
+            readelf -h "$path" > /dev/null
+            if readelf -l "$path" | grep -q INTERP || readelf -d "$path" | grep -q NEEDED; then
+              echo 'Delivery binaries must be statically linked' >&2
+              exit 1
+            fi
+          done
       - name: Prepare binary archive
         id: package
         env:
           ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
         run: |
           python3 - <<'PY'
           import hashlib, os, pathlib, shutil, tarfile, tomllib
@@ -69,7 +89,7 @@ jobs:
           delivery = staging / name
           delivery.mkdir()
           for binary in ['naxus', 'cargo-naxus', 'cargo-credential-naxus']:
-              shutil.copy2(pathlib.Path('target/release') / binary, delivery / binary)
+              shutil.copy2(pathlib.Path('target') / os.environ['TARGET'] / 'release' / binary, delivery / binary)
           for name in ['README.md', 'README.en.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'SECURITY.md', 'CONTRIBUTING.md']:
               shutil.copy2(name, delivery / name)
           shutil.copytree('zcf', delivery / 'zcf')
