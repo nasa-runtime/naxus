@@ -38,7 +38,29 @@ cargo naxus update          让 Cargo 重新选择约束内的版本
 
 公开包体首次按需拉取并核对 checksum 后长期保存。一个 proxy 对应一个逻辑 registry，其物理镜像按配置顺序尝试；其他独立 registry 保持独立身份。同一个数据根只允许一个活动写入者，服务端不执行上传代码。完整顺序与边界见[架构说明](docs/architecture.md)。
 
-## 构建和启动
+## Docker 启动
+
+镜像支持 `linux/amd64` 和 `linux/arm64`。本机启动时，将仓库数据与文件日志保存在独立持久卷中：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  nasaruntime/naxus:1.0.0
+```
+
+Admin 地址：`http://127.0.0.1:7443/admin/`。初始用户名为 `admin`，查看一次性口令：
+
+```sh
+docker exec naxus cat /var/lib/naxus/bootstrap/admin.password
+```
+
+首次登录后必须修改口令；复用数据卷不会重置账号。`naxus-data` 保存完整仓库数据，`naxus-logs` 保存文件日志。
+
+镜像内置 `application.yml`，无需挂载 YAML 即可启动。自定义配置时，将包含 `application.yml` 的目录只读挂载到 `/opt/naxus/zcf`，修改后重启服务。配置挂载、环境变量和远程 HTTPS 部署见[容器说明](docker/README.md)。
+
+## 从源码构建和启动
 
 要求 Rust/Cargo **1.97 或更新版本**。服务和客户端使用支持本地文件锁、原子改名和目录同步的 Linux/macOS 文件系统；Windows 尚不支持。SQLite 随程序编译，不需要数据库服务、Redis 或注册中心。
 
