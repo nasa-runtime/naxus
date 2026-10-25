@@ -16,7 +16,7 @@ include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
 [dependencies]
 anyhow.workspace = true
 flate2.workspace = true
-naxus-core = { version = "0.1.0", path = "../naxus-core" }
+naxus-core = { version = "1.0.0", path = "../naxus-core" }
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true

@@ -2,6 +2,8 @@
 
 [中文](README.md)
 
+Current product version: **1.0.0**.
+
 A Rust artifact repository for local development and remote teams. **Publish new contents under the same crate name and version** to a mutable repository. Each change creates an immutable revision and snapshot. `cargo naxus` refreshes the selected version's revision; `--locked` retains the recorded contents.
 
 Business projects configure one Naxus endpoint. Naxus proxies crates.io and explicitly configured public sparse registries, verifies original archive checksums, persists them, and serves subsequent requests from its cache. Admin, registry, health and metrics share one port. The same long-running service works locally, on a server, or in a container.

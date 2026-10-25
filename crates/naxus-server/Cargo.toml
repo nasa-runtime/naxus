@@ -20,9 +20,9 @@ futures-util.workspace = true
 httpdate.workspace = true
 hyper.workspace = true
 nasa.workspace = true
-naxus-core = { version = "0.1.0", path = "../naxus-core" }
-naxus-store = { version = "0.1.0", path = "../naxus-store" }
-naxus-registry = { version = "0.1.0", path = "../naxus-registry" }
+naxus-core = { version = "1.0.0", path = "../naxus-core" }
+naxus-store = { version = "1.0.0", path = "../naxus-store" }
+naxus-registry = { version = "1.0.0", path = "../naxus-registry" }
 reqwest.workspace = true
 rustls.workspace = true
 rusqlite.workspace = true

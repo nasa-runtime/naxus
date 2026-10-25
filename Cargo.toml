@@ -26,10 +26,10 @@ include = ["/Cargo.toml", "/Cargo.lock", "/rustfmt.toml", "/README*.md", "/LICEN
 [dependencies]
 anyhow.workspace = true
 nasa.workspace = true
-naxus-server = { version = "0.1.0", path = "crates/naxus-server" }
+naxus-server = { version = "1.0.0", path = "crates/naxus-server" }
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"

@@ -21,4 +21,4 @@ Naxus 的制品身份与持久化平台合同，支持同版本新修订与不�
 
 结构、target 语法和本 crate 的 feature 图校验不能代替 Cargo 对完整依赖闭包、平台条件实际匹配、依赖包目标支持、实际 feature 和工具链兼容性的解析，也不能代替归档检查、身份认证与仓库授权。调用者必须在相应边界执行这些操作。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-core/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-core/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-core/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-core/LICENSE-APACHE)。

@@ -12,4 +12,4 @@
 
 客户端私有目录 `.naxus` 在 Unix 上使用 0700，并在公开双锁恢复日志前持久化目录链。配置解析失败的诊断不回显配置正文。
 
-许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-client/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/main/crates/naxus-client/LICENSE-APACHE)。
+许可证可选择 [MIT](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-client/LICENSE-MIT) 或 [Apache-2.0](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-client/LICENSE-APACHE)。

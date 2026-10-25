@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=naxus-registry-${TARG
     && cp target/release/naxus target/release/cargo-naxus target/release/cargo-credential-naxus /build/out/
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
-ARG NAXUS_VERSION=0.1.0
+ARG NAXUS_VERSION=1.0.0
 ARG NAXUS_REVISION=local
 LABEL org.opencontainers.image.title="Naxus" \
       org.opencontainers.image.description="Rust artifact repository with same-version publishing, immutable snapshots and public registry caching" \
