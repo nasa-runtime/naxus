@@ -317,7 +317,7 @@ impl Config {
     }
 }
 
-/// 业务作用：在框架 preflight 前按显式参数、APP_CONFIG_FILE 和默认路径选择主配置，固定环境与 YAML 语义。
+/// 业务作用：在框架 preflight 前选择主配置，固定环境快照及 SQLite 容量字段的标量语义。
 /// 参数说明: 无。
 ///
 /// 返回：仓库命令对应的严格加载器；帮助或非法命令在创建运行时前结束。
@@ -366,6 +366,13 @@ pub fn bootstrap_loader() -> nasa::yml::strict::Result<ConfigLoader> {
                 std::process::exit(0);
             }
             let loader = ConfigLoader::standard()?.profile(ProfileSelection::Disabled);
+            let mut policy = loader.load_policy().clone();
+            // 数据源按 JSON 类型绑定，容量占位符必须先成为数字，才能与仓库写入预算保持一致。
+            policy.hints.insert(
+                nasa::yml::strict::ConfigPath::parse("datasources.naxus.min_free_bytes")?,
+                nasa::yml::strict::ValueHint::Scalar,
+            );
+            let loader = loader.policy(policy);
             match arguments.as_slice() {
                 [] => prepare_loader(loader),
                 [command] if command == "serve" => prepare_loader(loader),
