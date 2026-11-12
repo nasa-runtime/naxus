@@ -2,7 +2,7 @@
 
 ## 源码仓库
 
-公开入口为 `https://github.com/nasa-runtime/naxus`，默认分支 `release`。开发提交进入 `master`，发布时合并到 `release` 并创建对应产品标签；当前产品版本与源码标签均为 `1.0.0`。源码包含服务、两个客户端、库组件、双许可证、YAML 和部署文档；令牌、数据根、日志和本机运行材料不进入仓库。
+公开入口为 `https://github.com/nasa-runtime/naxus`，默认分支 `release`。开发提交进入 `master`，发布时合并到 `release` 并创建对应产品标签；当前产品版本与源码标签均为 `1.0.1`。源码包含服务、两个客户端、库组件、双许可证、YAML 和部署文档；令牌、数据根、日志和本机运行材料不进入仓库。
 
 ```sh
 git clone https://github.com/nasa-runtime/naxus.git

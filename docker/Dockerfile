@@ -27,7 +27,7 @@ COPY docker/runtime-rootfs.sh /build-runtime-rootfs.sh
 RUN sh /build-runtime-rootfs.sh
 
 FROM scratch
-ARG NAXUS_VERSION=1.0.0
+ARG NAXUS_VERSION=1.0.1
 ARG NAXUS_REVISION=local
 LABEL org.opencontainers.image.title="Naxus" \
       org.opencontainers.image.description="Rust artifact repository with same-version publishing, immutable snapshots and public registry caching" \

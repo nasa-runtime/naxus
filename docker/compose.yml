@@ -1,6 +1,6 @@
 services:
   naxus:
-    image: ${NAXUS_IMAGE:-nasaruntime/naxus:1.0.0}
+    image: ${NAXUS_IMAGE:-nasaruntime/naxus:1.0.1}
     container_name: naxus
     restart: unless-stopped
     ports:

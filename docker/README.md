@@ -6,7 +6,7 @@ Rust 本地制品仓库与远程私服，支持同版本新修订、不可变快
 
 ## 最简启动
 
-镜像地址为 `nasaruntime/naxus:1.0.0`。部署时使用版本标签，也可固定多架构 manifest digest。以下服务启动场景相互独立，选择其中一种；同一数据根只启动一个服务。默认命令面向 Linux 宿主机，保留完整数据、文件日志、只读时区挂载和回环端口映射：
+镜像地址为 `nasaruntime/naxus:1.0.1`。部署时使用版本标签，也可固定多架构 manifest digest。以下服务启动场景相互独立，选择其中一种；同一数据根只启动一个服务。默认命令面向 Linux 宿主机，保留完整数据、文件日志、只读时区挂载和回环端口映射：
 
 ```sh
 docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
@@ -14,7 +14,7 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 打开 `http://127.0.0.1:7443/admin/`。首次启动的用户名为 `admin`，查看一次性口令：
@@ -63,6 +63,47 @@ SQLite 由 NASA Application 的 `db` 组件统一管理，业务和结构 SQL �
 
 Docker Desktop 使用 Linux 原生 named volume，宿主共享目录不能作为数据根。Linux bind mount 需位于 ext4/XFS/Btrfs/F2FS/overlayfs；配置文件只读挂载不受数据根的该限制。只读容器根可加 `--read-only`，数据和日志卷仍需可写。
 
+### Docker Desktop 或显式时区
+
+macOS、Windows 的 Docker Desktop 使用 named volume 保存数据和日志，通过 `TZ` 设置容器时区，无需挂载宿主 `/etc/localtime`。Linux 也可使用这个方式：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -e TZ=Asia/Shanghai \
+  nasaruntime/naxus:1.0.1
+```
+
+### Linux 宿主目录
+
+数据根必须是 UID 10001 所有的 0700 目录。以下示例使用专用的新目录；已有数据目录先停服并核对所有权，不对其它目录递归变更权限：
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0700 /srv/naxus/data /srv/naxus/logs
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  --mount type=bind,src=/srv/naxus/data,dst=/var/lib/naxus \
+  --mount type=bind,src=/srv/naxus/logs,dst=/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/naxus:1.0.1
+```
+
+### 只读运行层
+
+保持数据和日志卷可写，为临时文件提供受限 tmpfs：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/naxus:1.0.1
+```
+
 ## APP_CONFIG_FILE 指定完整配置
 
 准备真实存在、UID 10001 可读取的 `/etc/naxus/application.yml`，以 [默认 YAML](../zcf/application.yml) 为基础保留完整应用及 SQLite datasource 配置。将整个配置目录只读挂载，再通过 `APP_CONFIG_FILE` 选择容器内的主文件：
@@ -75,12 +116,12 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v /etc/localtime:/etc/localtime:ro \
   --mount type=bind,src=/etc/naxus,dst=/etc/naxus,readonly \
   -e APP_CONFIG_FILE=/etc/naxus/application.yml \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 主文件选择优先级为 `serve --config <路径>` → 非空 `APP_CONFIG_FILE` → `zcf/application.yml`。环境变量未设置或为空时使用默认文件；选定文件不可读或无效时拒绝启动。相对主路径基于容器工作目录 `/opt/naxus`，部署时建议使用绝对路径。
 
-完整配置须包含 `datasources.naxus`，SQLite 文件与 `naxus.data.root` 使用同一数据根；多个 hosted/proxy、认证和镜像回源示例见[配置文档](../docs/configuration.md)。日志保持：
+显式配置 `datasources.naxus` 时，SQLite 文件与 `naxus.data.root` 必须使用同一数据根；未声明该数据源时自动使用单连接、WAL、FULL 和外键等受约束的默认值，不改写配置文件。多个 hosted/proxy、认证和镜像回源示例见[配置文档](../docs/configuration.md)。日志保持：
 
 ```yaml
 log:
@@ -97,6 +138,9 @@ log:
 environment:
   APP_CONFIG_FILE: /etc/naxus/application.yml
 volumes:
+  - naxus-data:/var/lib/naxus
+  - naxus-logs:/usr/local/logs/naxus
+  - /etc/localtime:/etc/localtime:ro
   - /etc/naxus:/etc/naxus:ro
 ```
 
@@ -111,7 +155,7 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v naxus-logs:/usr/local/logs/naxus \
   -v /etc/localtime:/etc/localtime:ro \
   --mount type=bind,src=/etc/naxus,dst=/etc/naxus,readonly \
-  nasaruntime/naxus:1.0.0 serve --config /etc/naxus/application.yml
+  nasaruntime/naxus:1.0.1 serve --config /etc/naxus/application.yml
 ```
 
 ## 环境变量与端口
@@ -135,11 +179,10 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
 docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -p 127.0.0.1:8443:7443 \
   -e NAXUS_PUBLIC_URL=http://127.0.0.1:8443 \
-  -e TZ=Asia/Shanghai \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 如需把容器端口本身改为 8443，还要设置 `NAXUS_PORT=8443` 并使用 `-p 127.0.0.1:8443:8443`。只改端口映射不会改变应用监听或对外 URL。
@@ -154,7 +197,7 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v /etc/localtime:/etc/localtime:ro \
   -e NAXUS_PORT=8443 \
   -e NAXUS_PUBLIC_URL=http://127.0.0.1:8443 \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 内置 YAML 通过 `NAXUS_PORT` 同时配置服务端口，healthcheck 使用同一变量。自定义 YAML 若把 `server.port` 写为固定值，另设 `NAXUS_HEALTH_URL=http://127.0.0.1:<容器端口>/readyz`；端口映射和规范 URL 仍须与实际入口一致。
@@ -167,6 +210,50 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
 
 容器与反向代理不在同一宿主时，按实际网络设置宿主监听地址或加入相同 Docker 网络。将宿主端口开放到外网本身不提供 TLS。Admin 默认地址是规范 URL 加 `/admin/`。
 
+宿主机上的 HTTPS 代理转发到 `127.0.0.1:7443` 时：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -e NAXUS_PUBLIC_URL=https://registry.example.com \
+  -e NAXUS_AUTH_MODE=managed \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/naxus:1.0.1
+```
+
+代理也在 Docker 内时，先创建专用网络，并让代理加入该网络。服务无需发布宿主端口，代理以 `http://naxus:7443` 转发：
+
+```sh
+docker network create naxus-net
+docker run -d --name naxus --network naxus-net --restart unless-stopped --stop-timeout 75 \
+  -e NAXUS_PUBLIC_URL=https://registry.example.com \
+  -e NAXUS_AUTH_MODE=managed \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/naxus:1.0.1
+```
+
+### 外部认证材料
+
+默认 `managed` 模式使用首次生成的管理员口令。需要自备引导口令时，在完整 YAML 中设置 `naxus.admin.bootstrap_password_file: /run/secrets/naxus-admin`。文件内容为高熵口令，宿主文件必须是 UID 10001 所有、权限 0600 的实体文件；已有管理员账号不会被这个文件重置。不要将口令写进镜像、命令参数或环境变量：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  --mount type=bind,src=/etc/naxus,dst=/etc/naxus,readonly \
+  --mount type=bind,src=/srv/naxus-secrets/admin.password,dst=/run/secrets/naxus-admin,readonly \
+  -e APP_CONFIG_FILE=/etc/naxus/application.yml \
+  nasaruntime/naxus:1.0.1
+```
+
+受控集成如需单一 token，在完整 YAML 中设置 `naxus.auth.mode: token`、`naxus.auth.token_file: /run/secrets/naxus-token`，按同样所有权和权限准备 token 文件，并把上述 secret 挂载改为 `src=/srv/naxus-secrets/repository.token,dst=/run/secrets/naxus-token`。该 token 具有全部仓库读写权限，不用于 Admin 登录；需要用户隔离时使用 managed 模式。
+
 ## 精简运行层与构建
 
 运行层从固定摘要的 Alpine 提取 CA 证书、时区和静态 BusyBox 基础命令，与静态 musl 服务程序一起装入空白镜像。镜像不包含编译工具、客户端或开发账号，也不使用可执行压缩器。保留标准退出、信号和持久化语义。
@@ -174,7 +261,9 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
 使用 `docker/Dockerfile.artifact` 装配镜像前，将目标架构对应的静态 musl 服务程序放到 `dist/naxus`。以 amd64 程序为例：
 
 ```sh
-docker build --platform linux/amd64 -f docker/Dockerfile.artifact -t naxus:1.0.0 .
+docker build --platform linux/amd64 -f docker/Dockerfile.artifact \
+  --build-arg NAXUS_VERSION=1.0.1 --build-arg NAXUS_REVISION=FULL_SOURCE_SHA \
+  -t naxus:1.0.1 .
 ```
 
 arm64 程序对应 `--platform linux/arm64`，不能只改变平台参数而复用另一个架构的二进制。发布流程将同一构建的程序同时放入 Linux 二进制归档与服务镜像，核对两者字节身份。提供 `linux/amd64` 和 `linux/arm64`；部署时自动选择对应平台，二进制归档说明见[交付文档](../docs/delivery.md#构建产物)。
@@ -186,7 +275,7 @@ arm64 程序对应 `--platform linux/arm64`，不能只改变平台参数而复�
 ```sh
 docker stop naxus
 docker run --rm -v naxus-data:/var/lib/naxus -v naxus-backups:/var/backups/naxus \
-  nasaruntime/naxus:1.0.0 backup --data-dir /var/lib/naxus --output /var/backups/naxus/saved
+  nasaruntime/naxus:1.0.1 backup --data-dir /var/lib/naxus --output /var/backups/naxus/saved
 docker start naxus
 ```
 
@@ -196,7 +285,7 @@ docker start naxus
 
 ```sh
 docker run --rm -v naxus-restored:/var/lib/naxus -v naxus-backups:/var/backups/naxus:ro \
-  nasaruntime/naxus:1.0.0 restore --backup /var/backups/naxus/saved --data-dir /var/lib/naxus/restored
+  nasaruntime/naxus:1.0.1 restore --backup /var/backups/naxus/saved --data-dir /var/lib/naxus/restored
 ```
 
 新服务挂载 `naxus-restored:/var/lib/naxus` 并设置 `NAXUS_DATA_PATH=/var/lib/naxus/restored`。恢复保留 UUID、账号和历史；外部 YAML、TLS 和 secret 文件另行保存。Compose 的实际卷名可能带项目前缀，备份命令应使用对应卷名。
