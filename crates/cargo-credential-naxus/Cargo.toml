@@ -13,5 +13,5 @@ include = ["/Cargo.toml", "/README.md", "/LICENSE-*", "/src/**"]
 
 [dependencies]
 anyhow.workspace = true
-naxus-client = "1.0.0"
+naxus-client.workspace = true
 serde_json.workspace = true

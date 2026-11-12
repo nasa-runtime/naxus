@@ -19,7 +19,7 @@ naxus serve --config zcf/application.yml
 
 需要 Rust/Cargo 1.97 或更新版本。两个客户端程序须位于 PATH 中，服务保持前台运行。在另一个终端继续以下操作；本机数据根默认为 `~/.naxus/repository`。
 
-主配置也可通过 `APP_CONFIG_FILE=/etc/naxus/application.yml naxus serve` 选择。显式 `serve --config` 优先；两者均未设置时使用进程工作目录中的 `zcf/application.yml`。完整配置须保留 `datasources.naxus`，具体字段见[配置说明](configuration.md)。
+主配置也可通过 `APP_CONFIG_FILE=/etc/naxus/application.yml naxus serve` 选择。显式 `serve --config` 优先；两者均未设置时使用进程工作目录中的 `zcf/application.yml`。未声明 `datasources.naxus` 时使用仓库 SQLite 默认值，显式数据源须符合单连接和持久化约束，具体字段见[配置说明](configuration.md)。
 
 打开 `http://127.0.0.1:7443/admin/`，以 `admin` 登录。首次口令位于数据根的 `bootstrap/admin.password`；设置新口令后该临时文件被移除。已有数据根不会重新生成账号。
 

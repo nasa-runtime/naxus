@@ -24,7 +24,7 @@ Admin 的非法名称、版本、游标和能力组合返回 400，超出账户�
 
 ## 配置、观测与边界
 
-`datasources.naxus.driver` 必须为 `sqlite`，数据库路径必须为 `naxus.data.root/naxus.sqlite3`，使用单连接、WAL、FULL 和外键检查。业务及结构 SQL 由存储层 Mapper trait 声明；自定义 YAML 必须包含该 datasource。SQL 或事务预算耗尽时明确失败，不自动重试业务写入；完整设置见[配置说明](https://github.com/nasa-runtime/naxus/blob/release/docs/configuration.md)。
+`datasources.naxus.driver` 必须为 `sqlite`，数据库路径必须为 `naxus.data.root/naxus.sqlite3`，使用单连接、WAL、FULL 和外键检查。业务及结构 SQL 由存储层 Mapper trait 声明；配置未声明该 datasource 时按数据根装配默认值，显式数据源不被覆盖。SQL 或事务预算耗尽时明确失败，不自动重试业务写入；完整设置见[配置说明](https://github.com/nasa-runtime/naxus/blob/release/docs/configuration.md)。
 
 `/healthz` 表示进程存活，`/readyz` 反映受管读取依赖状态；低容量通过写入状态单独表达。显式启用 `grafana.observability` 出口后，`/metrics` 在同一端口提供业务和 SQLite 指标；默认不另启指标端口。SQL 日志不输出绑定参数，指标标签不使用任意包名、用户或 URL。
 

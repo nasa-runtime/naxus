@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-Current product version: **1.0.0**.
+Current product version: **1.0.1**.
 
 A Rust artifact repository for local development and remote teams. **Publish new contents under the same crate name and version** to a mutable repository. Each change creates an immutable revision and snapshot. `cargo naxus` refreshes the selected version's revision; `--locked` retains the recorded contents.
 
@@ -35,7 +35,7 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 Open `http://127.0.0.1:7443/admin/`, log in as `admin`, and read the initial password with `docker exec naxus cat /var/lib/naxus/bootstrap/admin.password`. Change it on first login. Both named volumes retain their contents across container replacement. The image includes its default YAML. Complete commands for custom configuration, Docker Desktop, ports, timezone, reverse proxies and recovery are in the [Docker Hub guide](docker/README.md).
@@ -135,13 +135,13 @@ No multi-writer HA, zero-downtime upgrades, enterprise SSO, public signup, Cargo
 
 ## SQLite configuration
 
-Custom server YAML must configure `datasources.naxus` with driver `sqlite`, the database file `<naxus.data.root>/naxus.sqlite3`, one connection, WAL, FULL synchronization and foreign keys. NASA Application opens the datasource after the repository instance lock is acquired, and initialization completes schema upgrades and integrity checks before serving requests. Unknown schema progress, inconsistent references or an unsafe data directory prevent startup. See [configuration](docs/configuration.md) and [backup and recovery](docs/operations.md).
+SQLite uses the database file `<naxus.data.root>/naxus.sqlite3`, one connection, WAL, FULL synchronization and foreign keys. If `datasources.naxus` is absent, the service supplies these defaults without changing the YAML file. Explicit datasource settings must satisfy the same constraints. NASA Application opens the datasource after the repository instance lock is acquired, and initialization completes schema upgrades and integrity checks before serving requests. Unknown schema progress, inconsistent references or an unsafe data directory prevent startup. See [configuration](docs/configuration.md) and [backup and recovery](docs/operations.md).
 
 ## Documentation
 
 - [First use](docs/quickstart.md), [client commands and locks](docs/client.md), [architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md), [HTTP interfaces](docs/protocol.md), [operations and backups](docs/operations.md)
 - [Docker and volumes](docker/README.md), [GitHub and image delivery](docs/delivery.md), [troubleshooting and support](docs/troubleshooting.md)
-- [Core](crates/naxus-core/README.md), [store](crates/naxus-store/README.md), [registry](crates/naxus-registry/README.md), [server](crates/naxus-server/README.md), [client library](crates/naxus-client/README.md), [Cargo command](crates/cargo-naxus/README.md), [credential provider](crates/cargo-credential-naxus/README.md)
+- [Core](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-core/README.md), [store](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-store/README.md), [registry](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-registry/README.md), [server](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-server/README.md), [client library](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-client/README.md), [Cargo command](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-naxus/README.md), [credential provider](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-credential-naxus/README.md)
 
 Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). See [security](SECURITY.md) and [contributing](CONTRIBUTING.md).

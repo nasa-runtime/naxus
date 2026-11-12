@@ -26,16 +26,21 @@ include = ["/Cargo.toml", "/Cargo.lock", "/rustfmt.toml", "/README*.md", "/LICEN
 [dependencies]
 anyhow.workspace = true
 nasa = { workspace = true, features = ["application"] }
-naxus-server = "1.0.0"
+naxus-server.workspace = true
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nasa-runtime/naxus"
 
 [workspace.dependencies]
+naxus-core = { version = "=1.0.1", path = "crates/naxus-core" }
+naxus-store = { version = "=1.0.1", path = "crates/naxus-store" }
+naxus-registry = { version = "=1.0.1", path = "crates/naxus-registry" }
+naxus-server = { version = "=1.0.1", path = "crates/naxus-server" }
+naxus-client = { version = "=1.0.1", path = "crates/naxus-client" }
 anyhow = "1"
 cargo-platform = "=0.3.3"
 axum = "0.8"
@@ -46,7 +51,7 @@ hex = "0.4"
 httpdate = "1"
 hyper = "1"
 libc = "0.2"
-nasa = { version = "=2.0.6", default-features = false, features = ["mapper-sqlite"] }
+nasa = { version = "=2.0.7", default-features = false, features = ["mapper-sqlite"] }
 nabudget = "2.0.1"
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
@@ -70,10 +75,3 @@ zeroize = { version = "1", features = ["serde"] }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-
-[patch.crates-io]
-naxus-core = { path = "crates/naxus-core" }
-naxus-store = { path = "crates/naxus-store" }
-naxus-registry = { path = "crates/naxus-registry" }
-naxus-server = { path = "crates/naxus-server" }
-naxus-client = { path = "crates/naxus-client" }

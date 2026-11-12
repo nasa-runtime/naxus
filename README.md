@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-当前产品版本：**1.0.0**。
+当前产品版本：**1.0.1**。
 
 Rust 本地制品仓库与团队远程私服。开发仓库允许 **相同 crate 名称、相同版本重复发布新内容**，团队无需为了每次联调修改版本号。内容变化形成不可变修订和快照，配套 `cargo naxus` 默认刷新已选版本的新修订，`--locked` 保持原来的依赖内容。
 
@@ -48,7 +48,7 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/naxus:1.0.0
+  nasaruntime/naxus:1.0.1
 ```
 
 Admin 地址：`http://127.0.0.1:7443/admin/`。初始用户名为 `admin`，查看一次性口令：
@@ -85,7 +85,7 @@ Admin 地址为 `http://127.0.0.1:7443/admin/`。首次启动生成一次性管�
 
 主配置选择优先级为 `naxus serve --config <路径>` → 非空 `APP_CONFIG_FILE` → `zcf/application.yml`。选定文件不可读或校验失败时拒绝启动；主配置相对路径以进程工作目录解析。
 
-自定义 YAML 必须包含 `datasources.naxus`，使用 SQLite 单连接、WAL、FULL 同步与外键检查，数据库文件为数据根内的 `naxus.sqlite3`。启动先取得实例锁，再初始化数据库、升级结构并检查对象引用；未知结构或无法解释的数据缺失会阻止就绪。完整设置见[SQLite 数据源](docs/configuration.md#sqlite-数据源)。
+SQLite 使用单连接、WAL、FULL 同步与外键检查，数据库文件为数据根内的 `naxus.sqlite3`。未声明 `datasources.naxus` 时自动装配这些默认值；显式数据源必须满足相同约束。启动先取得实例锁，再初始化数据库、升级结构并检查对象引用；未知结构或无法解释的数据缺失会阻止就绪。完整设置见[SQLite 数据源](docs/configuration.md#sqlite-数据源)。
 
 从第一次登录、创建 token 到生产者和消费者联调的完整步骤见[首次接入](docs/quickstart.md)。Docker 用户见[容器说明](docker/README.md)；客户端需要单独安装在开发机或 CI 中，服务镜像不包含 Cargo 工具链。
 
@@ -173,12 +173,12 @@ Docker 默认 UID/GID `10001:10001`，数据 `/var/lib/naxus`，日志 `/usr/loc
 
 | 组件 | 职责 |
 | --- | --- |
-| [naxus-core](crates/naxus-core/README.md) | 身份、索引、修订、快照与文件系统合同 |
-| [naxus-store](crates/naxus-store/README.md) | SQLite、对象、批次、恢复、备份和管理事务 |
-| [naxus-registry](crates/naxus-registry/README.md) | 归档读取、manifest 与 Cargo 发布元数据一致性 |
-| [naxus-server](crates/naxus-server/README.md) | NASA 受管协议、代理及 Admin |
-| [naxus-client](crates/naxus-client/README.md) | 配置、凭据来源与双锁事务 |
-| [cargo-naxus](crates/cargo-naxus/README.md) / [cargo-credential-naxus](crates/cargo-credential-naxus/README.md) | 原生 Cargo 编排与凭据提供器 |
+| [naxus-core](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-core/README.md) | 身份、索引、修订、快照与文件系统合同 |
+| [naxus-store](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-store/README.md) | SQLite、对象、批次、恢复、备份和管理事务 |
+| [naxus-registry](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-registry/README.md) | 归档读取、manifest 与 Cargo 发布元数据一致性 |
+| [naxus-server](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-server/README.md) | NASA 受管协议、代理及 Admin |
+| [naxus-client](https://github.com/nasa-runtime/naxus/blob/release/crates/naxus-client/README.md) | 配置、凭据来源与双锁事务 |
+| [cargo-naxus](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-naxus/README.md) / [cargo-credential-naxus](https://github.com/nasa-runtime/naxus/blob/release/crates/cargo-credential-naxus/README.md) | 原生 Cargo 编排与凭据提供器 |
 
 ## 使用文档
 

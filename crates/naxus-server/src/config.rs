@@ -460,10 +460,10 @@ static PREPARED_STORE: std::sync::Mutex<Option<(PathBuf, naxus_store::PreparedSt
 /// 参数说明：
 /// - `loader`：已经固定文件位置与环境快照的严格配置入口。
 ///
-/// 返回：保留原配置入口；不满足持久化合同或实例冲突时在任何数据库连接前拒绝。
+/// 返回：完成旧配置默认值装配的入口；不满足持久化合同或实例冲突时在任何数据库连接前拒绝。
 fn prepare_loader(loader: ConfigLoader) -> nasa::yml::strict::Result<ConfigLoader> {
     use nasa::yml::strict::{ConfigError, ConfigPath, ErrorKind};
-    let loaded = loader.load()?;
+    let (loader, loaded) = legacy_datasource_defaults(loader)?;
     let config: Config = loaded.bind_at(&ConfigPath::parse("naxus")?)?;
     let result = (|| -> Result<()> {
         config.validate(
@@ -488,6 +488,120 @@ fn prepare_loader(loader: ConfigLoader) -> nasa::yml::strict::Result<ConfigLoade
         return Err(ConfigError::new(ErrorKind::Validation));
     }
     Ok(loader)
+}
+
+/// 业务作用：为未声明数据源的旧配置补充仓库 SQLite 默认值，保持原文件和冻结环境的装配边界。
+///
+/// 参数说明：
+/// - `loader`：已选定主文件、关闭 profile 的严格加载器。
+///
+/// 返回：完整数据源配置及加载器；显式数据源不被覆盖，来源变化、编码或配置不合法时拒绝启动。
+fn legacy_datasource_defaults(
+    loader: ConfigLoader,
+) -> nasa::yml::strict::Result<(ConfigLoader, nasa::yml::strict::LoadedConfig)> {
+    use std::collections::BTreeMap;
+
+    use nasa::yml::strict::{ConfigError, ConfigPath, EnvironmentSnapshot, ErrorKind, ValueHint};
+
+    let loaded = loader.load()?;
+    if loaded.tree().pointer("/datasources/naxus").is_some() {
+        // 显式配置必须自行满足持久化约束，不能用默认值掩盖错误驱动、路径或连接数。
+        return Ok((loader, loaded));
+    }
+    if loaded
+        .tree()
+        .get("datasources")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(ConfigError::new(ErrorKind::Binding).at(&ConfigPath::parse("datasources")?));
+    }
+    let config: Config = loaded.bind_at(&ConfigPath::parse("naxus")?)?;
+    let mut environment = BTreeMap::new();
+    for (name, _) in std::env::vars_os() {
+        let Ok(name) = name.into_string() else {
+            continue;
+        };
+        if let Some(value) = loader.environment().get(&name)? {
+            // 仅枚举名称；值始终取自原加载器快照，不接受两次装配之间出现的新环境值。
+            environment.insert(name, value.to_owned());
+        }
+    }
+    let mut policy = loader.load_policy().clone();
+    let root = if config.data.root.as_os_str().is_empty() {
+        let home = loader
+            .environment()
+            .get("HOME")?
+            .ok_or_else(|| ConfigError::new(ErrorKind::Missing))?;
+        let root = PathBuf::from(home).join(".naxus/repository");
+        environment.retain(|name, _| !name.eq_ignore_ascii_case("APP__NAXUS__DATA__ROOT"));
+        environment.insert(
+            "APP__NAXUS__DATA__ROOT".to_owned(),
+            root.to_str()
+                .ok_or_else(|| ConfigError::new(ErrorKind::Encoding))?
+                .to_owned(),
+        );
+        policy
+            .hints
+            .insert(ConfigPath::parse("naxus.data.root")?, ValueHint::Literal);
+        root
+    } else {
+        config.data.root
+    };
+    let database = std::path::absolute(root.join("naxus.sqlite3"))
+        .map_err(|_| ConfigError::new(ErrorKind::Unreadable))?;
+    let path = database
+        .to_str()
+        .ok_or_else(|| ConfigError::new(ErrorKind::Encoding))?;
+    for (name, value) in [
+        ("DRIVER", "sqlite".to_owned()),
+        ("SQLITE__PATH", path.to_owned()),
+        ("SQLITE__CREATE_IF_MISSING", "true".to_owned()),
+        ("SQLITE__JOURNAL_MODE", "wal".to_owned()),
+        ("SQLITE__SYNCHRONOUS", "full".to_owned()),
+        ("SQLITE__FOREIGN_KEYS", "true".to_owned()),
+        ("SQLITE__BUSY_TIMEOUT_MS", "5000".to_owned()),
+        ("MIN_CONNECTIONS", "1".to_owned()),
+        ("MAX_CONNECTIONS", "1".to_owned()),
+        ("TRANSACTION_TIMEOUT_MS", "300000".to_owned()),
+        ("MAX_RESULT_ROWS", "1000000".to_owned()),
+        ("MAX_RESULT_BYTES", "268435456".to_owned()),
+        (
+            "MIN_FREE_BYTES",
+            config
+                .data
+                .hard_free_bytes
+                .unwrap_or(2 * 1024 * 1024 * 1024)
+                .to_string(),
+        ),
+    ] {
+        environment.insert(format!("APP__DATASOURCES__NAXUS__{name}"), value);
+        if !matches!(name, "DRIVER" | "SQLITE__PATH") {
+            policy.hints.insert(
+                ConfigPath::parse(&format!(
+                    "datasources.naxus.{}",
+                    name.to_ascii_lowercase().replace("__", ".")
+                ))?,
+                ValueHint::Scalar,
+            );
+        }
+    }
+    policy.hints.insert(
+        ConfigPath::parse("datasources.naxus.sqlite.path")?,
+        ValueHint::Literal,
+    );
+    let base = loader
+        .base_path()
+        .ok_or_else(|| ConfigError::new(ErrorKind::Missing))?;
+    let compatible = ConfigLoader::memory(EnvironmentSnapshot::from_pairs(environment)?)
+        .base_file(base)?
+        .profile(ProfileSelection::Disabled)
+        .policy(policy);
+    let candidate = compatible.load()?;
+    // 默认值只适用于已观察到的旧来源；装配期间文件被替换时，必须重新启动以复验显式配置。
+    if candidate.source_fingerprint() != loaded.source_fingerprint() {
+        return Err(ConfigError::new(ErrorKind::SourceChanged));
+    }
+    Ok((compatible, candidate))
 }
 
 /// 业务作用：约束受管数据源和对象根保持同一持久身份，避免元数据与文件落在不同目录。

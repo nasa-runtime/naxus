@@ -8,7 +8,7 @@
 APP_CONFIG_FILE=/etc/naxus/application.yml naxus serve
 ```
 
-`APP_CONFIG_FILE` 选择整份应用配置，不是附加业务配置。文件须同时包含必要的 Application、日志、Web、仓库与 `datasources.naxus` 设置，可从 [默认 YAML](../zcf/application.yml) 调整。配置在启动时固定；文件变化后重启服务，容器环境变化后重建容器。
+`APP_CONFIG_FILE` 选择整份应用配置，不是附加业务配置。文件须包含必要的 Application、日志、Web 和仓库设置，可从 [默认 YAML](../zcf/application.yml) 调整。未声明 `datasources.naxus` 时使用下述 SQLite 默认值；显式声明的数据源必须完整且符合仓库约束。配置在启动时固定；文件变化后重启服务，容器环境变化后重建容器。
 
 ```yaml
 application:
@@ -119,7 +119,9 @@ datasources:
 
 ## SQLite 数据源
 
-`datasources.naxus` 由 NASA `db` 组件创建，`driver` 固定为 `sqlite`。NASA 可按来源选择已编译的 driver；Naxus 当前仅启用 SQLite，文件元数据不支持换成 MySQL 或 PostgreSQL。数据库路径必须指向 `naxus.data.root/naxus.sqlite3`，且 `max_connections: 1`、WAL、FULL、外键和可写模式是仓库的启动合同。自定义配置文件也须提供这个 datasource。
+`datasources.naxus` 由 NASA `db` 组件创建，`driver` 固定为 `sqlite`。NASA 可按来源选择已编译的 driver；Naxus 当前仅启用 SQLite，文件元数据不支持换成 MySQL 或 PostgreSQL。数据库路径必须指向 `naxus.data.root/naxus.sqlite3`，且 `max_connections: 1`、WAL、FULL、外键和可写模式是仓库的启动合同。
+
+未声明 `datasources.naxus` 的配置仍可启动：服务按当前数据根补入 SQLite 文件路径、创建许可、WAL、FULL、外键、5000 毫秒忙等待、单连接、300000 毫秒事务期限、一百万行和 256 MiB 查询上限；数据库空闲空间下限取 `naxus.data.hard_free_bytes`，未设置时为 2 GiB。旧配置中空的数据根继续使用当前用户的 `~/.naxus/repository`。这些默认值只在内存中装配，不改写 YAML。显式数据源即使为空、为 null 或只配置部分字段，也不会被默认值替换；路径、驱动或连接策略不合法时拒绝启动。
 
 `operation_timeout_ms` 默认 30000，示例将 `transaction_timeout_ms` 设为 300000。事务覆盖完整业务变更，超过总期限会回滚并拒绝该事务后续 SQL，不自动重试写入。`max_result_rows` 与 `max_result_bytes` 限制单次完整查询的内存使用，示例为一百万行和 256 MiB；结果超限明确失败，不返回截断结果。数据库 `min_free_bytes` 应与 `naxus.data.hard_free_bytes` 保持一致，默认 2 GiB。
 

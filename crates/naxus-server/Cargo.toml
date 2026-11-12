@@ -20,9 +20,9 @@ futures-util.workspace = true
 httpdate.workspace = true
 hyper.workspace = true
 nasa = { workspace = true, features = ["application", "web-auth", "yml", "log", "secret", "crypto"] }
-naxus-core = "1.0.0"
-naxus-store = "1.0.0"
-naxus-registry = "1.0.0"
+naxus-core.workspace = true
+naxus-store.workspace = true
+naxus-registry.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 sqlx.workspace = true

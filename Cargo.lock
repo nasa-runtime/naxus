@@ -325,7 +325,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cargo-credential-naxus"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "naxus-client",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-naxus"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "naxus-client",
@@ -1817,9 +1817,9 @@ dependencies = [
 
 [[package]]
 name = "napp"
-version = "2.0.6"
+version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64e44b0678b58ffd8d69d57c805924a0a9e65e7d7ef9c9919d5fca16f59774b"
+checksum = "5cbf67cbfdb12680063d4e1b30f03833b05e11183c71574ec4dc45f5c3686006"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1881,9 +1881,9 @@ dependencies = [
 
 [[package]]
 name = "nasa"
-version = "2.0.6"
+version = "2.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c930ce0ce76c6197728601142d9e7fb01af50a498bf30de7380a43acc6e9c44"
+checksum = "27270a1f7eb97099464e323f0a669db40b4bcc08e4b3a0c47d46b844346538d7"
 dependencies = [
  "nalog",
  "namapper-sqlite",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "naxus"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "nasa",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "naxus-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "fs2",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "naxus-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "cargo-platform",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "naxus-registry"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "naxus-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "naxus-store"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "fs2",
