@@ -3,9 +3,9 @@ use std::{
     fs,
 };
 
+use crate::database::{params, Connection, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Context, Result};
 use naxus_core::{ArtifactDigest, Coordinate};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -74,12 +74,11 @@ impl Store {
     /// 返回：最近二百个任务，不从文件系统推断任务结果。
     pub fn deletion_tasks(&self) -> Result<Vec<DeletionTask>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id FROM object_deletions ORDER BY created_at DESC, rowid DESC LIMIT 200",
-        )?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::DeletionDeletionTasksQueryObjectDeletions)?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .query_map(crate::database::params![], |row| row.get::<_, String>(0))?
+            .collect::<sqlx::Result<Vec<_>>>()?;
         ids.iter().map(|id| read_task(&connection, id)).collect()
     }
 
@@ -88,7 +87,13 @@ impl Store {
     ///
     /// 返回：最早仍未完成的任务 UUID，没有任务则为 None。
     pub fn pending_deletion(&self) -> Result<Option<String>> {
-        Ok(self.connection()?.query_row("SELECT id FROM object_deletions WHERE state IN ('accepted', 'running') AND next_attempt_at <= unixepoch() ORDER BY next_attempt_at, created_at, rowid LIMIT 1", [], |row| row.get(0)).optional()?)
+        self.connection()?
+            .query_row(
+                crate::statements::Statement::DeletionPendingDeletionQueryObjectDeletions,
+                crate::database::params![],
+                |row| row.get(0),
+            )
+            .optional()
     }
 
     /// 业务作用：为未完成的清除保留失败分类并退避，避免一项故障永久阻塞后续任务。
@@ -111,7 +116,10 @@ impl Store {
         } else {
             "storage_operation_failed"
         };
-        self.connection()?.execute("UPDATE object_deletions SET attempts = attempts + 1, last_error_code = ?1, next_attempt_at = unixepoch() + min(3600, 5 * (1 << min(attempts, 10))) WHERE id = ?2 AND state IN ('accepted', 'running')", params![code, id])?;
+        self.connection()?.execute(
+            crate::statements::Statement::DeletionDeferDeletionUpdateObjectDeletions,
+            params![code, id],
+        )?;
         Ok(())
     }
 
@@ -127,7 +135,16 @@ impl Store {
         let actor = crate::security::browser_actor(&transaction, actor)?;
         let task = read_task(&transaction, id)?;
         if task.scope.kind == "unpublished" {
-            let grants: String = transaction.query_row("SELECT repositories FROM admin_users WHERE id = ?1 AND role IN ('admin', 'operator') AND enabled = 1 AND must_change = 0", [actor], |row| row.get(0)).optional()?.context(crate::RepositoryFailure::Forbidden("maintenance retry permission denied"))?;
+            let grants: String = transaction
+                .query_row(
+                    crate::statements::Statement::DeletionRetryDeletionQueryAdminUsers,
+                    [actor],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context(crate::RepositoryFailure::Forbidden(
+                    "maintenance retry permission denied",
+                ))?;
             ensure!(
                 serde_json::from_str::<Vec<String>>(&grants)?
                     .iter()
@@ -137,9 +154,12 @@ impl Store {
         } else {
             deletion_permission(&transaction, actor, &task.scope)?;
         }
-        transaction.execute("UPDATE object_deletions SET next_attempt_at = 0 WHERE id = ?1 AND state IN ('accepted', 'running')", [id])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'retry-clear', ?2)",
+            crate::statements::Statement::DeletionRetryDeletionUpdateObjectDeletions,
+            [id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::DeletionRetryDeletionInsertSecurityAudit,
             params![actor, id],
         )?;
         transaction.commit()?;
@@ -164,9 +184,12 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
         let mut preview = self.deletion_view(&transaction, actor, scope)?;
-        transaction.execute("DELETE FROM deletion_previews WHERE id IN (SELECT id FROM deletion_previews WHERE state = 'prepared' AND expires_at <= unixepoch() LIMIT 256)", [])?;
+        transaction.execute(
+            crate::statements::Statement::DeletionPreviewDeletionDeleteDeletionPreviews,
+            crate::database::params![],
+        )?;
         let count: u64 = transaction.query_row(
-            "SELECT count(*) FROM deletion_previews WHERE actor = ?1 AND state = 'prepared'",
+            crate::statements::Statement::DeletionPreviewDeletionQueryDeletionPreviews,
             [actor],
             |row| row.get(0),
         )?;
@@ -175,7 +198,16 @@ impl Store {
             crate::ResourceLimitExceeded("deletion preview budget exceeded")
         );
         preview.id = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO deletion_previews(id, actor, scope, fingerprint, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![preview.id, actor, serde_json::to_string(scope)?, preview.fingerprint.as_str(), preview.expires_at])?;
+        transaction.execute(
+            crate::statements::Statement::DeletionPreviewDeletionInsertDeletionPreviews,
+            params![
+                preview.id,
+                actor,
+                serde_json::to_string(scope)?,
+                preview.fingerprint.as_str(),
+                preview.expires_at
+            ],
+        )?;
         transaction.commit()?;
         Ok(preview)
     }
@@ -200,7 +232,12 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let (scope, digest, active, task): (String, String, bool, Option<String>) = transaction.query_row("SELECT scope, fingerprint, expires_at > unixepoch(), task_id FROM deletion_previews WHERE id = ?1 AND actor = ?2", params![preview_id, actor], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        let (scope, digest, active, task): (String, String, bool, Option<String>) = transaction
+            .query_row(
+                crate::statements::Statement::DeletionAcceptDeletionQueryDeletionPreviews,
+                params![preview_id, actor],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
         let scope: DeletionScope = serde_json::from_str(&scope)?;
         let identity = deletion_permission(&transaction, actor, &scope)?;
         ensure!(
@@ -230,8 +267,8 @@ impl Store {
             )
         );
         let pending: u64 = transaction.query_row(
-            "SELECT count(*) FROM object_deletions WHERE state IN ('accepted', 'running')",
-            [],
+            crate::statements::Statement::DeletionAcceptDeletionQueryObjectDeletions,
+            crate::database::params![],
             |row| row.get(0),
         )?;
         ensure!(
@@ -245,18 +282,21 @@ impl Store {
         }
         let id = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO object_deletions(id, actor, scope, state) VALUES (?1, ?2, ?3, 'accepted')",
+            crate::statements::Statement::DeletionAcceptDeletionInsertObjectDeletions,
             params![id, actor, serde_json::to_string(&scope)?],
         )?;
         for object in &view.objects {
             if scope.kind == "hosted" {
                 for revision in &object.revisions {
-                    transaction.execute("INSERT OR IGNORE INTO artifact_access_revocations(revision_id, deletion_id, actor) VALUES (?1, ?2, ?3)", params![revision, id, actor])?;
+                    transaction.execute(crate::statements::Statement::DeletionAcceptDeletionInsertArtifactAccessRevocations, params![revision, id, actor])?;
                 }
             } else {
-                transaction.execute("UPDATE proxy_materializations SET valid = 0 WHERE proxy_id = ?1 AND id IN (SELECT materialization_id FROM materialization_items WHERE digest = ?2)", params![identity.repository_id, object.digest.as_str()])?;
                 transaction.execute(
-                    "DELETE FROM proxy_objects WHERE proxy_id = ?1 AND digest = ?2",
+                    crate::statements::Statement::DeletionAcceptDeletionUpdateProxyMaterializations,
+                    params![identity.repository_id, object.digest.as_str()],
+                )?;
+                transaction.execute(
+                    crate::statements::Statement::DeletionAcceptDeletionDeleteProxyObjects,
                     params![identity.repository_id, object.digest.as_str()],
                 )?;
             }
@@ -265,31 +305,49 @@ impl Store {
             } else {
                 "deleting"
             };
-            transaction.execute("INSERT INTO deletion_items(deletion_id, digest, generation, size, state) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, object.digest.as_str(), object.generation, object.size, state])?;
+            transaction.execute(
+                crate::statements::Statement::DeletionAcceptDeletionInsertDeletionItems,
+                params![
+                    id,
+                    object.digest.as_str(),
+                    object.generation,
+                    object.size,
+                    state
+                ],
+            )?;
             if state == "deleting" {
-                ensure!(transaction.execute("UPDATE objects SET state = 'deleting' WHERE sha256 = ?1 AND generation = ?2 AND state = 'present'", params![object.digest.as_str(), object.generation])? == 1, crate::RepositoryFailure::Conflict("object generation changed".to_owned()));
+                ensure!(
+                    transaction.execute(
+                        crate::statements::Statement::DeletionAcceptDeletionUpdateObjects,
+                        params![object.digest.as_str(), object.generation]
+                    )? == 1,
+                    crate::RepositoryFailure::Conflict("object generation changed".to_owned())
+                );
             }
         }
         if scope.kind == "proxy" {
             // 清缓存不删除来源或历史摘要证据，也不创建任何包名或版本封禁。
             transaction.execute(
-                "DELETE FROM proxy_indexes WHERE proxy_id = ?1 AND name = ?2",
+                crate::statements::Statement::DeletionAcceptDeletionDeleteProxyIndexes,
                 params![identity.repository_id, scope.name],
             )?;
             transaction.execute(
-                "DELETE FROM proxy_validators WHERE proxy_id = ?1 AND name = ?2",
+                crate::statements::Statement::DeletionAcceptDeletionDeleteProxyValidators,
                 params![identity.repository_id, scope.name],
             )?;
             transaction.execute(
-                "DELETE FROM proxy_missing WHERE proxy_id = ?1 AND name = ?2",
+                crate::statements::Statement::DeletionAcceptDeletionDeleteProxyMissing,
                 params![identity.repository_id, scope.name],
             )?;
         }
         transaction.execute(
-            "UPDATE deletion_previews SET state = 'accepted', task_id = ?1 WHERE id = ?2",
+            crate::statements::Statement::DeletionAcceptDeletionUpdateDeletionPreviews,
             params![id, preview_id],
         )?;
-        transaction.execute("INSERT INTO security_audit(actor, action, target) VALUES (?1, 'accept_physical_clear', ?2)", params![actor, id])?;
+        transaction.execute(
+            crate::statements::Statement::DeletionAcceptDeletionInsertSecurityAudit,
+            params![actor, id],
+        )?;
         transaction.commit()?;
         read_task(&connection, &id)
     }
@@ -307,7 +365,8 @@ impl Store {
             if task.state == "completed" {
                 return Ok(task);
             }
-            let mut statement = connection.prepare("SELECT digest, generation, size FROM deletion_items WHERE deletion_id = ?1 AND state = 'deleting' ORDER BY digest")?;
+            let mut statement = connection
+                .prepare(crate::statements::Statement::DeletionRunDeletionQueryDeletionItems)?;
             let items = statement
                 .query_map([id], |row| {
                     Ok((
@@ -316,8 +375,11 @@ impl Store {
                         row.get::<_, u64>(2)?,
                     ))
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            connection.execute("UPDATE object_deletions SET state = 'running' WHERE id = ?1 AND state = 'accepted'", [id])?;
+                .collect::<sqlx::Result<Vec<_>>>()?;
+            connection.execute(
+                crate::statements::Statement::DeletionRunDeletionUpdateObjectDeletions,
+                [id],
+            )?;
             items
         };
         for (digest, generation, size) in items {
@@ -329,14 +391,18 @@ impl Store {
             {
                 let connection = self.connection()?;
                 let item: String = connection.query_row(
-                    "SELECT state FROM deletion_items WHERE deletion_id = ?1 AND digest = ?2",
+                    crate::statements::Statement::DeletionRunDeletionQueryDeletionItems2,
                     params![id, digest.as_str()],
                     |row| row.get(0),
                 )?;
                 if item != "deleting" {
                     continue;
                 }
-                let valid: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM objects WHERE sha256 = ?1 AND generation = ?2 AND state = 'deleting')", params![digest.as_str(), generation], |row| row.get(0))?;
+                let valid: bool = connection.query_row(
+                    crate::statements::Statement::DeletionRunDeletionQueryObjects,
+                    params![digest.as_str(), generation],
+                    |row| row.get(0),
+                )?;
                 // 旧任务只能处理自己取得删除权的代次，不能碰后来重新安装的同摘要文件。
                 ensure!(
                     valid,
@@ -380,16 +446,29 @@ impl Store {
             let mut connection = self.connection()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            ensure!(transaction.execute("UPDATE objects SET state = 'purged' WHERE sha256 = ?1 AND generation = ?2 AND state = 'deleting'", params![digest.as_str(), generation])? == 1, crate::RepositoryFailure::Conflict("deletion object generation changed".to_owned()));
-            transaction.execute("UPDATE deletion_items SET state = 'purged' WHERE deletion_id = ?1 AND digest = ?2 AND generation = ?3 AND state = 'deleting'", params![id, digest.as_str(), generation])?;
+            ensure!(
+                transaction.execute(
+                    crate::statements::Statement::DeletionRunDeletionUpdateObjects,
+                    params![digest.as_str(), generation]
+                )? == 1,
+                crate::RepositoryFailure::Conflict("deletion object generation changed".to_owned())
+            );
             transaction.execute(
-                "UPDATE object_deletions SET released_bytes = released_bytes + ?1 WHERE id = ?2",
+                crate::statements::Statement::DeletionRunDeletionUpdateDeletionItems,
+                params![id, digest.as_str(), generation],
+            )?;
+            transaction.execute(
+                crate::statements::Statement::DeletionRunDeletionUpdateObjectDeletions2,
                 params![size, id],
             )?;
             transaction.commit()?;
         }
         let connection = self.connection()?;
-        let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM deletion_items WHERE deletion_id = ?1 AND state = 'deleting')", [id], |row| row.get(0))?;
+        let pending: bool = connection.query_row(
+            crate::statements::Statement::DeletionRunDeletionQueryDeletionItems3,
+            [id],
+            |row| row.get(0),
+        )?;
         if !pending {
             let directory = self.root.join("trash").join(id);
             if directory.try_exists()? {
@@ -397,7 +476,7 @@ impl Store {
                 objects::sync_directory(&self.root.join("trash"))?;
             }
             connection.execute(
-                "UPDATE object_deletions SET state = 'completed', last_error_code = NULL, next_attempt_at = 0 WHERE id = ?1",
+                crate::statements::Statement::DeletionRunDeletionUpdateObjectDeletions3,
                 [id],
             )?;
         }
@@ -411,11 +490,13 @@ impl Store {
     pub(crate) fn recover_deletions(&self) -> Result<()> {
         let pending = {
             let connection = self.connection()?;
-            let mut statement = connection.prepare("SELECT id FROM object_deletions WHERE state IN ('accepted', 'running') ORDER BY created_at LIMIT 9")?;
-            let pending = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            pending
+            let mut statement = connection.prepare(
+                crate::statements::Statement::DeletionRecoverDeletionsQueryObjectDeletions,
+            )?;
+
+            statement
+                .query_map(crate::database::params![], |row| row.get::<_, String>(0))?
+                .collect::<sqlx::Result<Vec<_>>>()?
         };
         ensure!(
             pending.len() <= 8,
@@ -453,7 +534,8 @@ impl Store {
         let identity = deletion_permission(connection, actor, scope)?;
         let mut objects = BTreeMap::<ArtifactDigest, DeletionObject>::new();
         if scope.kind == "hosted" {
-            let mut statement = connection.prepare("SELECT r.id, o.sha256, o.generation, o.size, o.state FROM revisions r JOIN objects o ON o.sha256 = r.sha256 WHERE r.repository_id = ?1 AND r.name = ?2 AND (?3 IS NULL OR r.version = ?3) AND (?4 IS NULL OR r.id = ?4) LIMIT 1025")?;
+            let mut statement = connection
+                .prepare(crate::statements::Statement::DeletionDeletionViewQueryRevisions)?;
             let rows = statement
                 .query_map(
                     params![
@@ -472,7 +554,7 @@ impl Store {
                         ))
                     },
                 )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+                .collect::<sqlx::Result<Vec<_>>>()?;
             ensure!(
                 rows.len() <= 1024,
                 crate::ResourceLimitExceeded("deletion selection exceeds limit")
@@ -497,7 +579,8 @@ impl Store {
                     .push(revision);
             }
         } else {
-            let mut statement = connection.prepare("SELECT DISTINCT o.sha256, o.generation, o.size, o.state FROM proxy_coordinates c JOIN proxy_objects p ON p.proxy_id = c.proxy_id AND p.digest = c.digest JOIN objects o ON o.sha256 = c.digest WHERE c.proxy_id = ?1 AND c.name = ?2 AND (?3 IS NULL OR c.version = ?3) LIMIT 257")?;
+            let mut statement = connection
+                .prepare(crate::statements::Statement::DeletionDeletionViewQueryProxyCoordinates)?;
             let rows = statement
                 .query_map(
                     params![identity.repository_id, scope.name, scope.version],
@@ -510,7 +593,7 @@ impl Store {
                         ))
                     },
                 )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+                .collect::<sqlx::Result<Vec<_>>>()?;
             for (digest, generation, size, state) in rows {
                 let digest: ArtifactDigest = digest.parse()?;
                 objects.insert(
@@ -546,18 +629,27 @@ impl Store {
             if readers.contains_key(&object.digest) {
                 blockers.insert(format!("对象存在活动读取：{}", object.digest));
             }
-            let publishing: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM batch_items i JOIN publish_batches b ON b.id = i.batch_id WHERE b.state IN ('open', 'validating') AND b.expires_at > unixepoch() AND json_extract(i.entry_json, '$.cksum') = ?1)", [object.digest.as_str()], |row| row.get(0))?;
+            let publishing: bool = connection.query_row(
+                crate::statements::Statement::DeletionDeletionViewQueryBatchItems,
+                [object.digest.as_str()],
+                |row| row.get(0),
+            )?;
             if publishing {
                 blockers.insert(format!("发布批次仍引用对象：{}", object.digest));
             }
-            let resolving: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM proxy_session_objects o JOIN proxy_sessions s ON s.id = o.session_id WHERE s.expires_at > unixepoch() AND o.digest = ?1) OR EXISTS(SELECT 1 FROM proxy_session_entries e JOIN proxy_sessions s ON s.id = e.session_id WHERE s.expires_at > unixepoch() AND NOT EXISTS(SELECT 1 FROM proxy_session_objects o WHERE o.session_id = e.session_id AND o.name = e.name))", [object.digest.as_str()], |row| row.get(0))?;
+            let resolving: bool = connection.query_row(
+                crate::statements::Statement::DeletionDeletionViewQueryProxySessionObjects,
+                [object.digest.as_str()],
+                |row| row.get(0),
+            )?;
             if resolving {
                 blockers.insert(format!("公开解析视图仍保护对象：{}", object.digest));
             }
-            let mut statement = connection.prepare("SELECT r.id FROM revisions r WHERE r.sha256 = ?1 AND NOT EXISTS(SELECT 1 FROM artifact_access_revocations a WHERE a.revision_id = r.id) LIMIT 1025")?;
+            let mut statement = connection
+                .prepare(crate::statements::Statement::DeletionDeletionViewQueryRevisions2)?;
             let references = statement
                 .query_map([object.digest.as_str()], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+                .collect::<sqlx::Result<Vec<_>>>()?;
             ensure!(
                 references.len() <= 1024,
                 crate::ResourceLimitExceeded("deletion reference budget exceeded")
@@ -565,7 +657,11 @@ impl Store {
             object.shared = references
                 .iter()
                 .any(|revision| !identity.revisions.contains(revision));
-            let proxy_shared: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM proxy_objects WHERE digest = ?1 AND (?2 != 'proxy' OR proxy_id != ?3))", params![object.digest.as_str(), scope.kind, identity.repository_id], |row| row.get(0))?;
+            let proxy_shared: bool = connection.query_row(
+                crate::statements::Statement::DeletionDeletionViewQueryProxyObjects,
+                params![object.digest.as_str(), scope.kind, identity.repository_id],
+                |row| row.get(0),
+            )?;
             object.shared |= proxy_shared;
             if scope.kind == "hosted" {
                 for revision in references
@@ -603,7 +699,11 @@ impl Store {
             blockers,
             reclaimable_bytes,
             fingerprint,
-            expires_at: connection.query_row("SELECT unixepoch() + 300", [], |row| row.get(0))?,
+            expires_at: connection.query_row(
+                crate::statements::Statement::DeletionDeletionViewQueryValue,
+                crate::database::params![],
+                |row| row.get(0),
+            )?,
             refetch_allowed: scope.kind == "proxy",
         })
     }
@@ -644,17 +744,26 @@ fn deletion_permission(
             "public cache clearing cannot revoke hosted history"
         )
     );
-    let grants: String = connection.query_row("SELECT repositories FROM admin_users WHERE id = ?1 AND role IN ('admin', 'operator') AND enabled = 1 AND must_change = 0", [actor], |row| row.get(0)).optional()?.context(crate::RepositoryFailure::Forbidden("physical clear permission denied"))?;
+    let grants: String = connection
+        .query_row(
+            crate::statements::Statement::DeletionDeletionPermissionQueryAdminUsers,
+            [actor],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context(crate::RepositoryFailure::Forbidden(
+            "physical clear permission denied",
+        ))?;
     let grants: Vec<String> = serde_json::from_str(&grants)?;
     let repository_id: String = if scope.kind == "hosted" {
         connection.query_row(
-            "SELECT id FROM repositories WHERE id = ?1 OR name = ?1",
+            crate::statements::Statement::DeletionDeletionPermissionQueryRepositories,
             [&scope.repository],
             |row| row.get(0),
         )?
     } else {
         connection.query_row(
-            "SELECT id FROM proxy_repositories WHERE id = ?1 OR name = ?1",
+            crate::statements::Statement::DeletionDeletionPermissionQueryProxyRepositories,
             [&scope.repository],
             |row| row.get(0),
         )?
@@ -667,13 +776,14 @@ fn deletion_permission(
     );
     let mut revisions = BTreeSet::new();
     if scope.kind == "hosted" {
-        let mut statement = connection.prepare("SELECT id FROM revisions WHERE repository_id = ?1 AND name = ?2 AND (?3 IS NULL OR version = ?3) AND (?4 IS NULL OR id = ?4) LIMIT 1025")?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::DeletionDeletionPermissionQueryRevisions)?;
         let selected = statement
             .query_map(
                 params![repository_id, scope.name, scope.version, scope.revision],
                 |row| row.get::<_, String>(0),
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         ensure!(
             selected.len() <= 1024,
             crate::ResourceLimitExceeded("deletion selection exceeds limit")
@@ -703,7 +813,7 @@ fn protect_revision(
     budget: &mut usize,
 ) -> Result<()> {
     let (repository, name, version): (String, String, String) = connection.query_row(
-        "SELECT repository_id, name, version FROM revisions WHERE id = ?1",
+        crate::statements::Statement::DeletionProtectRevisionQueryRevisions,
         [revision],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -711,12 +821,13 @@ fn protect_revision(
         name,
         version,
     };
-    let mut statement = connection.prepare("SELECT head, 'HEAD' FROM repositories WHERE id = ?1 UNION SELECT l.snapshot_id, '活动租约' FROM retention_leases l JOIN snapshots s ON s.id = l.snapshot_id WHERE s.repository_id = ?1 AND l.expires_at > unixepoch() UNION SELECT p.snapshot_id, '保留点' FROM retention_pins p JOIN snapshots s ON s.id = p.snapshot_id WHERE s.repository_id = ?1 LIMIT 4097")?;
+    let mut statement = connection
+        .prepare(crate::statements::Statement::DeletionProtectRevisionQueryRepositories)?;
     let snapshots = statement
         .query_map([repository], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<sqlx::Result<Vec<_>>>()?;
     ensure!(
         snapshots.len() <= 4096,
         crate::ResourceLimitExceeded("deletion retention budget exceeded")
@@ -747,7 +858,7 @@ fn protect_revision(
 /// 返回：阶段、范围与已提交释放字节；未知任务返回错误。
 fn read_task(connection: &Connection, id: &str) -> Result<DeletionTask> {
     let (state, released_bytes, scope): (String, u64, String) = connection.query_row(
-        "SELECT state, released_bytes, scope FROM object_deletions WHERE id = ?1",
+        crate::statements::Statement::DeletionReadTaskQueryObjectDeletions,
         [id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
@@ -757,17 +868,17 @@ fn read_task(connection: &Connection, id: &str) -> Result<DeletionTask> {
         released_bytes,
         scope: serde_json::from_str(&scope)?,
         attempts: connection.query_row(
-            "SELECT attempts FROM object_deletions WHERE id = ?1",
+            crate::statements::Statement::DeletionReadTaskQueryObjectDeletions2,
             [id],
             |row| row.get(0),
         )?,
         next_attempt_at: connection.query_row(
-            "SELECT next_attempt_at FROM object_deletions WHERE id = ?1",
+            crate::statements::Statement::DeletionReadTaskQueryObjectDeletions3,
             [id],
             |row| row.get(0),
         )?,
         last_error_code: connection.query_row(
-            "SELECT last_error_code FROM object_deletions WHERE id = ?1",
+            crate::statements::Statement::DeletionReadTaskQueryObjectDeletions4,
             [id],
             |row| row.get(0),
         )?,

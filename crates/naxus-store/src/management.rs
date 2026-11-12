@@ -1,6 +1,6 @@
+use crate::database::{params, Connection, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Context, Result};
 use naxus_core::{ArtifactDigest, Coordinate, IndexEntry, Snapshot};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -79,11 +79,12 @@ impl Store {
         );
         let connection = self.connection()?;
         let (id, head): (String, String) = connection.query_row(
-            "SELECT id, head FROM repositories WHERE id = ?1 OR name = ?1",
+            crate::statements::Statement::ManagementCatalogQueryRepositories,
             [repository],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let mut statement = connection.prepare("SELECT DISTINCT name, version FROM revisions WHERE repository_id = ?1 AND (?2 IS NULL OR name = ?2) AND name || '@' || version > ?3 ORDER BY name || '@' || version LIMIT 201")?;
+        let mut statement =
+            connection.prepare(crate::statements::Statement::ManagementCatalogQueryRevisions)?;
         let mut coordinates = statement
             .query_map(params![id, name, after], |row| {
                 Ok(Coordinate {
@@ -91,7 +92,7 @@ impl Store {
                     version: row.get(1)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         let more = coordinates.len() > 200;
         coordinates.truncate(200);
         let next = if more {
@@ -167,13 +168,8 @@ impl Store {
             crate::RepositoryFailure::InvalidRequest("invalid revision history cursor")
         );
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT v.id, v.sha256, v.metadata_sha256, v.actor, v.entry_json, v.rowid
-             FROM revisions v JOIN repositories r ON r.id = v.repository_id
-             WHERE (r.name = ?1 OR r.id = ?1) AND v.name = ?2 AND v.version = ?3
-               AND (?4 = 0 OR v.rowid < ?4)
-             ORDER BY v.rowid DESC LIMIT 201",
-        )?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::ManagementRevisionHistoryPageQueryRevisions)?;
         let mut rows = statement
             .query_map(params![repository, name, version, before], |row| {
                 Ok((
@@ -185,7 +181,7 @@ impl Store {
                     row.get::<_, i64>(5)?,
                 ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         let more = rows.len() > 200;
         rows.truncate(200);
         // 以已返回的末条记录继续读取，新增修订不会挤占或重复更早页中的记录。
@@ -249,7 +245,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
         let (repository_id, head): (String, String) = transaction.query_row(
-            "SELECT id, head FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::ManagementPreviewHostedQueryRepositories,
             [&action.repository],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -257,12 +253,13 @@ impl Store {
         let versions = if let Some(version) = &action.version {
             vec![version.clone()]
         } else {
-            let mut statement = transaction.prepare("SELECT DISTINCT version FROM revisions WHERE repository_id = ?1 AND name = ?2 LIMIT 4097")?;
+            let mut statement = transaction
+                .prepare(crate::statements::Statement::ManagementPreviewHostedQueryRevisions)?;
             let versions = statement
                 .query_map(params![repository_id, action.name], |row| {
                     row.get::<_, String>(0)
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+                .collect::<sqlx::Result<Vec<_>>>()?;
             ensure!(
                 versions.len() <= 4096,
                 crate::ResourceLimitExceeded("management selection exceeds limit")
@@ -283,7 +280,12 @@ impl Store {
             )?;
             if current.is_none() {
                 if let Some(revision) = &action.revision {
-                    let (json, metadata, publisher): (String, String, String) = transaction.query_row("SELECT entry_json, metadata_sha256, actor FROM revisions WHERE id = ?1 AND repository_id = ?2 AND name = ?3 AND version = ?4", params![revision, repository_id, coordinate.name, coordinate.version], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                    let (json, metadata, publisher): (String, String, String) = transaction
+                        .query_row(
+                            crate::statements::Statement::ManagementPreviewHostedQueryRevisions2,
+                            params![revision, repository_id, coordinate.name, coordinate.version],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )?;
                     // 逻辑移除后仍可显式选择保留的历史作为回退目标；提交时继续复验撤销状态和字节。
                     current = Some(naxus_core::Revision {
                         id: revision.clone(),
@@ -296,7 +298,11 @@ impl Store {
             }
             if let Some(current) = current {
                 let replacement = if let Some(revision) = &action.revision {
-                    let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM revisions WHERE id = ?1 AND repository_id = ?2 AND name = ?3 AND version = ?4)", params![revision, repository_id, coordinate.name, coordinate.version], |row| row.get(0))?;
+                    let valid: bool = transaction.query_row(
+                        crate::statements::Statement::ManagementPreviewHostedQueryRevisions3,
+                        params![revision, repository_id, coordinate.name, coordinate.version],
+                        |row| row.get(0),
+                    )?;
                     // 回退只能引用当前坐标的历史，不能把另一包或版本的修订发布为目标内容。
                     ensure!(
                         valid,
@@ -327,9 +333,12 @@ impl Store {
             &action.operation,
             &selected,
         ))?);
-        transaction.execute("DELETE FROM management_previews WHERE id IN (SELECT id FROM management_previews WHERE state = 'prepared' AND expires_at <= unixepoch() LIMIT 256)", [])?;
+        transaction.execute(
+            crate::statements::Statement::ManagementPreviewHostedDeleteManagementPreviews,
+            crate::database::params![],
+        )?;
         let active: u64 = transaction.query_row(
-            "SELECT count(*) FROM management_previews WHERE state = 'prepared' AND actor = ?1",
+            crate::statements::Statement::ManagementPreviewHostedQueryManagementPreviews,
             [actor],
             |row| row.get(0),
         )?;
@@ -353,9 +362,25 @@ impl Store {
             retained_history: true,
             reclaimable_bytes: 0,
             fingerprint,
-            expires_at: transaction.query_row("SELECT unixepoch() + 300", [], |row| row.get(0))?,
+            expires_at: transaction.query_row(
+                crate::statements::Statement::ManagementPreviewHostedQueryValue,
+                crate::database::params![],
+                |row| row.get(0),
+            )?,
         };
-        transaction.execute("INSERT INTO management_previews(id, actor, repository_id, expected_head, operation, selection, fingerprint, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![preview.id, actor, preview.repository_id, preview.expected_head, preview.operation, serde_json::to_string(&selected)?, preview.fingerprint.as_str(), preview.expires_at])?;
+        transaction.execute(
+            crate::statements::Statement::ManagementPreviewHostedInsertManagementPreviews,
+            params![
+                preview.id,
+                actor,
+                preview.repository_id,
+                preview.expected_head,
+                preview.operation,
+                serde_json::to_string(&selected)?,
+                preview.fingerprint.as_str(),
+                preview.expires_at
+            ],
+        )?;
         transaction.commit()?;
         Ok(preview)
     }
@@ -386,7 +411,43 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let (repository, expected, operation, selection, digest, active, state, previous_key, committed): (String, String, String, String, String, bool, String, Option<String>, Option<String>) = transaction.query_row("SELECT repository_id, expected_head, operation, selection, fingerprint, expires_at > unixepoch(), state, commit_key, committed_snapshot FROM management_previews WHERE id = ?1 AND actor = ?2", params![id, actor], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)))?;
+        let (
+            repository,
+            expected,
+            operation,
+            selection,
+            digest,
+            active,
+            state,
+            previous_key,
+            committed,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = transaction.query_row(
+            crate::statements::Statement::ManagementCommitHostedManagementQueryManagementPreviews,
+            params![id, actor],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
         management_permission(&transaction, actor, &repository)?;
         ensure!(
             digest == fingerprint.as_str(),
@@ -407,7 +468,7 @@ impl Store {
             crate::RepositoryFailure::Conflict("management preview expired".to_owned())
         );
         let head: String = transaction.query_row(
-            "SELECT head FROM repositories WHERE id = ?1",
+            crate::statements::Statement::ManagementCommitHostedManagementQueryRepositories,
             [&repository],
             |row| row.get(0),
         )?;
@@ -437,17 +498,21 @@ impl Store {
             let version = selected.coordinate.version;
             if operation == "remove" {
                 transaction.execute(
-                    "INSERT INTO snapshot_removals(snapshot_id, name, version) VALUES (?1, ?2, ?3)",
+                    crate::statements::Statement::ManagementCommitHostedManagementInsertSnapshotRemovals,
                     params![snapshot.id, name, version],
                 )?;
                 continue;
             }
             let revision = if let Some(replacement) = selected.replacement {
-                let revoked: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM artifact_access_revocations WHERE revision_id = ?1)", [&replacement], |row| row.get(0))?;
+                let revoked: bool = transaction.query_row(crate::statements::Statement::ManagementCommitHostedManagementQueryArtifactAccessRevocations, [&replacement], |row| row.get(0))?;
                 if revoked {
                     return Err(crate::ArtifactGone.into());
                 }
-                let digest: String = transaction.query_row("SELECT sha256 FROM revisions WHERE id = ?1 AND repository_id = ?2 AND name = ?3 AND version = ?4", params![replacement, repository, name, version], |row| row.get(0))?;
+                let digest: String = transaction.query_row(
+                    crate::statements::Statement::ManagementCommitHostedManagementQueryRevisions,
+                    params![replacement, repository, name, version],
+                    |row| row.get(0),
+                )?;
                 objects::verify_object(&self.root, &digest.parse()?, None)?;
                 replacement
             } else {
@@ -456,24 +521,42 @@ impl Store {
                 entry.validate()?;
                 objects::verify_object(&self.root, &entry.cksum, None)?;
                 let revision = Uuid::new_v4().to_string();
-                transaction.execute("INSERT INTO revisions(id, repository_id, name, version, sha256, metadata_sha256, entry_json, actor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![revision, repository, name, version, entry.cksum.as_str(), entry.metadata_digest()?.as_str(), serde_json::to_string(&entry)?, actor])?;
+                transaction.execute(
+                    crate::statements::Statement::ManagementCommitHostedManagementInsertRevisions,
+                    params![
+                        revision,
+                        repository,
+                        name,
+                        version,
+                        entry.cksum.as_str(),
+                        entry.metadata_digest()?.as_str(),
+                        serde_json::to_string(&entry)?,
+                        actor
+                    ],
+                )?;
                 revision
             };
-            transaction.execute("INSERT INTO snapshot_changes(snapshot_id, name, version, revision_id) VALUES (?1, ?2, ?3, ?4)", params![snapshot.id, name, version, revision])?;
+            transaction.execute(
+                crate::statements::Statement::ManagementCommitHostedManagementInsertSnapshotChanges,
+                params![snapshot.id, name, version, revision],
+            )?;
         }
         materialize_checkpoint(&transaction, &snapshot.id, self.options.max_snapshot_depth)?;
         // 修改、审计和预览终态先进入事务，最后发布 HEAD，读者只能观察完整结果。
         transaction.execute(
-            "INSERT INTO audit(actor, action, repository_id, snapshot_id) VALUES (?1, ?2, ?3, ?4)",
+            crate::statements::Statement::ManagementCommitHostedManagementInsertAudit,
             params![actor, operation, repository, snapshot.id],
         )?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, ?2, ?3)",
+            crate::statements::Statement::ManagementCommitHostedManagementInsertSecurityAudit,
             params![actor, operation, id],
         )?;
-        transaction.execute("UPDATE management_previews SET state = 'committed', commit_key = ?1, committed_snapshot = ?2 WHERE id = ?3", params![key, snapshot.id, id])?;
         transaction.execute(
-            "UPDATE repositories SET head = ?1 WHERE id = ?2 AND head = ?3",
+            crate::statements::Statement::ManagementCommitHostedManagementUpdateManagementPreviews,
+            params![key, snapshot.id, id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::ManagementCommitHostedManagementUpdateRepositories,
             params![snapshot.id, repository, expected],
         )?;
         transaction.commit()?;
@@ -493,7 +576,13 @@ pub(crate) fn management_permission(
     actor: &str,
     repository: &str,
 ) -> Result<()> {
-    let grants: Option<String> = connection.query_row("SELECT repositories FROM admin_users WHERE id = ?1 AND role IN ('admin', 'operator') AND enabled = 1 AND must_change = 0", [actor], |row| row.get(0)).optional()?;
+    let grants: Option<String> = connection
+        .query_row(
+            crate::statements::Statement::ManagementManagementPermissionQueryAdminUsers,
+            [actor],
+            |row| row.get(0),
+        )
+        .optional()?;
     let grants: Vec<String> = serde_json::from_str(&grants.context(
         crate::RepositoryFailure::Forbidden("management permission denied"),
     )?)?;

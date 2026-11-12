@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::database::{params, Connection, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Result};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -24,7 +24,8 @@ impl Store {
     /// 返回：最多四千零九十六个保留点，不改变引用或 HEAD。
     pub fn retention_pins(&self, repository: &str) -> Result<Vec<RetentionPin>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT p.id, p.snapshot_id, p.actor, p.reason FROM retention_pins p JOIN snapshots s ON s.id = p.snapshot_id JOIN repositories r ON r.id = s.repository_id WHERE r.name = ?1 OR r.id = ?1 ORDER BY p.rowid DESC LIMIT 4096")?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::RetentionRetentionPinsQueryRetentionPins)?;
         let pins = statement
             .query_map([repository], |row| {
                 Ok(RetentionPin {
@@ -34,7 +35,7 @@ impl Store {
                     reason: row.get(3)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         Ok(pins)
     }
 
@@ -65,7 +66,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
         let repository_id: String = transaction.query_row(
-            "SELECT id FROM repositories WHERE id = ?1 OR name = ?1",
+            crate::statements::Statement::RetentionPinSnapshotQueryRepositories,
             [repository],
             |row| row.get(0),
         )?;
@@ -80,7 +81,7 @@ impl Store {
         );
         let existing: Option<String> = transaction
             .query_row(
-                "SELECT id FROM retention_pins WHERE actor = ?1 AND snapshot_id = ?2 LIMIT 1",
+                crate::statements::Statement::RetentionPinSnapshotQueryRetentionPins,
                 params![actor, snapshot],
                 |row| row.get(0),
             )
@@ -89,7 +90,7 @@ impl Store {
             return Ok(id);
         }
         let (total, owned): (u64, u64) = transaction.query_row(
-            "SELECT count(*), coalesce(sum(actor = ?1), 0) FROM retention_pins",
+            crate::statements::Statement::RetentionPinSnapshotQueryRetentionPins2,
             [actor],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -101,7 +102,11 @@ impl Store {
             snapshot_revisions(&transaction, snapshot, self.options.max_snapshot_depth)?;
         // 保留权与对象清除共用生命周期门禁，已经撤销的历史不能借保留点重新开放。
         for revision in revisions {
-            let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM revisions r JOIN objects o ON o.sha256 = r.sha256 WHERE r.id = ?1 AND o.state = 'present' AND NOT EXISTS(SELECT 1 FROM artifact_access_revocations a WHERE a.revision_id = r.id))", [revision], |row| row.get(0))?;
+            let valid: bool = transaction.query_row(
+                crate::statements::Statement::RetentionPinSnapshotQueryRevisions,
+                [revision],
+                |row| row.get(0),
+            )?;
             ensure!(
                 valid,
                 crate::RepositoryFailure::Conflict(
@@ -111,11 +116,11 @@ impl Store {
         }
         let id = Uuid::new_v4().to_string();
         transaction.execute(
-            "INSERT INTO retention_pins(id, snapshot_id, actor, reason) VALUES (?1, ?2, ?3, ?4)",
+            crate::statements::Statement::RetentionPinSnapshotInsertRetentionPins,
             params![id, snapshot, actor, reason],
         )?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'pin-snapshot', ?2)",
+            crate::statements::Statement::RetentionPinSnapshotInsertSecurityAudit,
             params![actor, id],
         )?;
         transaction.commit()?;
@@ -138,11 +143,18 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let repository_id: String = transaction.query_row("SELECT r.id FROM retention_pins p JOIN snapshots s ON s.id = p.snapshot_id JOIN repositories r ON r.id = s.repository_id WHERE p.id = ?1 AND (r.name = ?2 OR r.id = ?2)", params![id, repository], |row| row.get(0))?;
+        let repository_id: String = transaction.query_row(
+            crate::statements::Statement::RetentionReleasePinQueryRetentionPins,
+            params![id, repository],
+            |row| row.get(0),
+        )?;
         management_permission(&transaction, actor, &repository_id)?;
-        transaction.execute("DELETE FROM retention_pins WHERE id = ?1", [id])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'release-pin', ?2)",
+            crate::statements::Statement::RetentionReleasePinDeleteRetentionPins,
+            [id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::RetentionReleasePinInsertSecurityAudit,
             params![actor, id],
         )?;
         transaction.commit()?;
@@ -177,7 +189,7 @@ fn snapshot_revisions(
             "retention snapshot crosses repositories"
         );
         let mut removals = connection.prepare(
-            "SELECT name, version FROM snapshot_removals WHERE snapshot_id = ?1 LIMIT 4097",
+            crate::statements::Statement::RetentionSnapshotRevisionsQuerySnapshotRemovals,
         )?;
         for coordinate in removals.query_map([&id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -189,11 +201,13 @@ fn snapshot_revisions(
             );
         }
         let checkpoint: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshot_checkpoints WHERE snapshot_id = ?1)",
+            crate::statements::Statement::RetentionSnapshotRevisionsQuerySnapshotCheckpoints,
             [&id],
             |row| row.get(0),
         )?;
-        let mut entries = connection.prepare("SELECT name, version, revision_id, 0 FROM snapshot_changes WHERE snapshot_id = ?1 UNION ALL SELECT name, version, revision_id, 1 FROM checkpoint_entries WHERE snapshot_id = ?1 ORDER BY 4, 1, 2 LIMIT 8193")?;
+        let mut entries = connection.prepare(
+            crate::statements::Statement::RetentionSnapshotRevisionsQuerySnapshotChanges,
+        )?;
         let mut count = 0;
         for entry in entries.query_map([&id], |row| {
             Ok((

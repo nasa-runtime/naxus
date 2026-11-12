@@ -21,25 +21,31 @@ impl Store {
     pub fn maintain(&self, verify_after: Option<&str>) -> Result<StorageStatus> {
         let connection = self.connection()?;
         connection.query_row(
-            "SELECT 1 FROM metadata WHERE key = 'service_id'",
-            [],
+            crate::statements::Statement::MaintenanceMaintainQueryMetadata,
+            crate::database::params![],
             |_| Ok(()),
         )?;
         for statement in [
-            "UPDATE publish_batches SET state = 'expired' WHERE id IN (SELECT id FROM publish_batches WHERE state = 'open' AND expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM proxy_sessions WHERE id IN (SELECT id FROM proxy_sessions WHERE expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM retention_leases WHERE id IN (SELECT id FROM retention_leases WHERE expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM admin_sessions WHERE digest IN (SELECT digest FROM admin_sessions WHERE expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM proxy_missing WHERE rowid IN (SELECT rowid FROM proxy_missing WHERE expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM management_previews WHERE id IN (SELECT id FROM management_previews WHERE state = 'prepared' AND expires_at <= unixepoch() LIMIT 256)",
-            "DELETE FROM deletion_previews WHERE id IN (SELECT id FROM deletion_previews WHERE state = 'prepared' AND expires_at <= unixepoch() LIMIT 256)",
+            crate::statements::Statement::MaintenanceMaintainUpdatePublishBatches,
+            crate::statements::Statement::MaintenanceMaintainDeleteProxySessions,
+            crate::statements::Statement::MaintenanceMaintainDeleteRetentionLeases,
+            crate::statements::Statement::MaintenanceMaintainDeleteAdminSessions,
+            crate::statements::Statement::MaintenanceMaintainDeleteProxyMissing,
+            crate::statements::Statement::MaintenanceMaintainDeleteManagementPreviews,
+            crate::statements::Statement::MaintenanceMaintainDeleteDeletionPreviews,
         ] {
-            connection.execute(statement, [])?;
+            connection.execute(statement, crate::database::params![])?;
         }
         let mut next_verified_digest = verify_after.unwrap_or_default().to_owned();
         if let Some(after) = verify_after {
-            use rusqlite::OptionalExtension;
-            let object: Option<(String, u64)> = connection.query_row("SELECT sha256, size FROM objects WHERE state = 'present' AND sha256 > ?1 ORDER BY sha256 LIMIT 1", [after], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            use crate::database::OptionalExtension;
+            let object: Option<(String, u64)> = connection
+                .query_row(
+                    crate::statements::Statement::MaintenanceMaintainQueryObjects,
+                    [after],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             if let Some((digest, size)) = object {
                 objects::verify_object(&self.root, &digest.parse()?, Some(size))?;
                 next_verified_digest = digest;
@@ -47,7 +53,7 @@ impl Store {
                 next_verified_digest.clear();
             }
         }
-        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        connection.checkpoint()?;
         let free_bytes = fs2::available_space(&self.root)?;
         Ok(StorageStatus {
             free_bytes,

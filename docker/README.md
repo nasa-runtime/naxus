@@ -2,17 +2,18 @@
 
 Rust 本地制品仓库与远程私服，支持同版本新修订、不可变快照、公共 sparse registry 缓存和同端口 Admin。开发机与 CI 使用配套 `cargo naxus` 客户端；镜像只运行服务，不包含 Rust 编译器或 Cargo。
 
-[English guide](../README.en.md)
+[English guide](../README.en.md)。提供 `linux/amd64`、`linux/arm64`，默认 UID/GID 为 `10001:10001`。
 
 ## 最简启动
 
-镜像地址为 `nasaruntime/naxus:1.0.0`。部署时使用已发布的版本标签，也可固定多架构 manifest digest。
+镜像地址为 `nasaruntime/naxus:1.0.0`。部署时使用版本标签，也可固定多架构 manifest digest。以下服务启动场景相互独立，选择其中一种；同一数据根只启动一个服务。默认命令面向 Linux 宿主机，保留完整数据、文件日志、只读时区挂载和回环端口映射：
 
 ```sh
 docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -p 127.0.0.1:7443:7443 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
   nasaruntime/naxus:1.0.0
 ```
 
@@ -35,7 +36,7 @@ docker start naxus
 
 ## Compose
 
-源码仓库已提供默认镜像、持久卷、75 秒停机宽限和标准输出日志轮转：
+源码仓库的 Linux 示例已提供默认镜像、数据与日志持久卷、只读宿主时区、75 秒停机宽限和标准输出日志轮转：
 
 ```sh
 docker compose -f docker/compose.yml up -d
@@ -51,28 +52,35 @@ docker compose -f docker/compose.yml logs -f
 | 完整仓库数据 | `/var/lib/naxus` | named volume `naxus-data`，必须持久保存 |
 | 文件日志 | `/usr/local/logs/naxus` | named volume `naxus-logs` |
 | 默认 YAML | `/opt/naxus/zcf/application.yml` | 镜像内置，可将配置目录只读挂载到 `/opt/naxus/zcf` |
+| 宿主时区 | `/etc/localtime` | Linux 宿主同名文件，只读 bind mount |
 | 备份目录 | `/var/backups/naxus` | 备份操作时挂载独立卷或受限路径 |
 
 数据包含 SQLite/WAL/SHM、原始对象、稳定服务/仓库 UUID、账号、快照、恢复和清除记录，不能只挂载 objects。一个数据根只允许一个活动写入者。
+
+SQLite 由 NASA Application 的 `db` 组件统一管理，业务和结构 SQL 使用 Mapper trait。启动先取得实例锁，再完成结构升级、恢复与完整性检查；制品文件持久化后才提交数据库引用。备份与恢复同时保留元数据和对象，不能只复制数据库主文件。
 
 默认 UID/GID 为 `10001:10001`，新建 named volume 自动使用镜像预置目录的所有权。数据根属于运行用户且权限为 0700；不需要以 root 启动。原生 Linux 使用自定义 bind mount 或 `--user` 时，先设置目录所有权，不能仅授予组写权限。镜像不会自行修改任意宿主路径的所有者。
 
 Docker Desktop 使用 Linux 原生 named volume，宿主共享目录不能作为数据根。Linux bind mount 需位于 ext4/XFS/Btrfs/F2FS/overlayfs；配置文件只读挂载不受数据根的该限制。只读容器根可加 `--read-only`，数据和日志卷仍需可写。
 
-## 挂载自定义 YAML 目录
+## APP_CONFIG_FILE 指定完整配置
 
-准备真实存在、可读取的 `/path/to/naxus-conf/application.yml`，将整个配置目录挂载到容器。数据仍使用持久卷：
+准备真实存在、UID 10001 可读取的 `/etc/naxus/application.yml`，以 [默认 YAML](../zcf/application.yml) 为基础保留完整应用及 SQLite datasource 配置。将整个配置目录只读挂载，再通过 `APP_CONFIG_FILE` 选择容器内的主文件：
 
 ```sh
 docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -p 127.0.0.1:7443:7443 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
-  --mount type=bind,src=/path/to/naxus-conf,dst=/opt/naxus/zcf,readonly \
+  -v /etc/localtime:/etc/localtime:ro \
+  --mount type=bind,src=/etc/naxus,dst=/etc/naxus,readonly \
+  -e APP_CONFIG_FILE=/etc/naxus/application.yml \
   nasaruntime/naxus:1.0.0
 ```
 
-完整配置以仓库的 `zcf/application.yml` 为基础；多个 hosted/proxy、认证和镜像回源示例见[配置文档](../docs/configuration.md)。日志保持：
+主文件选择优先级为 `serve --config <路径>` → 非空 `APP_CONFIG_FILE` → `zcf/application.yml`。环境变量未设置或为空时使用默认文件；选定文件不可读或无效时拒绝启动。相对主路径基于容器工作目录 `/opt/naxus`，部署时建议使用绝对路径。
+
+完整配置须包含 `datasources.naxus`，SQLite 文件与 `naxus.data.root` 使用同一数据根；多个 hosted/proxy、认证和镜像回源示例见[配置文档](../docs/configuration.md)。日志保持：
 
 ```yaml
 log:
@@ -83,16 +91,34 @@ log:
 
 内置 YAML 通过占位符读取环境变量。自定义文件若把端口、路径等写成固定值，同名环境变量不会自动覆盖，须保留相应占位符。当前业务配置在启动时固定，修改目录中的 YAML 后执行 `docker restart naxus`；没有运行中热加载。环境变量属于容器创建配置，修改后需重建容器，单纯 restart 不会更新环境。
 
-Compose 可在服务的 volumes 中追加：
+已有部署也可将整个目录挂载到 `/opt/naxus/zcf`，继续使用默认文件名。使用 Compose 指定外部主文件时，在服务中增加：
 
 ```yaml
-- /path/to/naxus-conf:/opt/naxus/zcf:ro
+environment:
+  APP_CONFIG_FILE: /etc/naxus/application.yml
+volumes:
+  - /etc/naxus:/etc/naxus:ro
+```
+
+### 命令行显式选择配置
+
+同样准备完整配置目录，显式参数优先于 `APP_CONFIG_FILE`：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  --mount type=bind,src=/etc/naxus,dst=/etc/naxus,readonly \
+  nasaruntime/naxus:1.0.0 serve --config /etc/naxus/application.yml
 ```
 
 ## 环境变量与端口
 
 | 变量 | 镜像或内置 YAML 默认值 | 作用 |
 | --- | --- | --- |
+| `APP_CONFIG_FILE` | 未设置，读取 `/opt/naxus/zcf/application.yml` | 选择完整应用主配置，显式 `serve --config` 优先 |
 | `NAXUS_HOST` | `0.0.0.0` | 容器内监听地址 |
 | `NAXUS_PORT` | `7443` | 容器内服务端口，Admin、Cargo、健康和指标共用 |
 | `NAXUS_PUBLIC_URL` | `http://127.0.0.1:7443` | 客户端和浏览器使用的规范外部入口 |
@@ -101,7 +127,7 @@ Compose 可在服务的 volumes 中追加：
 | `NAXUS_LOG_LEVEL` | `info` | 日志级别 |
 | `NAXUS_AUTH_MODE` | `managed` | 账号及独立 token 认证，远程部署保持该值 |
 | `NAXUS_HEALTH_URL` | 按 NAXUS_PORT 构造回环 readyz | 自定义 YAML 固定其他端口时可显式指定健康检查入口 |
-| `TZ` | `Etc/UTC` | IANA 时区，例如 `Asia/Shanghai` |
+| `TZ` | 未设置；无挂载时 `/etc/localtime` 为 UTC | 显式 IANA 时区优先于 `/etc/localtime` 挂载，例如 `Asia/Shanghai` |
 
 宿主端口由 `-p` 控制，与容器内监听端口分开。仅将宿主端口改为 8443 时保留容器端口，并同步规范 URL：
 
@@ -112,10 +138,26 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -e TZ=Asia/Shanghai \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
   nasaruntime/naxus:1.0.0
 ```
 
 如需把容器端口本身改为 8443，还要设置 `NAXUS_PORT=8443` 并使用 `-p 127.0.0.1:8443:8443`。只改端口映射不会改变应用监听或对外 URL。
+
+完整的容器端口变更命令：
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:8443:8443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  -e NAXUS_PORT=8443 \
+  -e NAXUS_PUBLIC_URL=http://127.0.0.1:8443 \
+  nasaruntime/naxus:1.0.0
+```
+
+内置 YAML 通过 `NAXUS_PORT` 同时配置服务端口，healthcheck 使用同一变量。自定义 YAML 若把 `server.port` 写为固定值，另设 `NAXUS_HEALTH_URL=http://127.0.0.1:<容器端口>/readyz`；端口映射和规范 URL 仍须与实际入口一致。
 
 `DOCKERHUB_*` 只用于 GitHub 发布，不传给服务容器。业务 token 在 Admin 签发，客户端通过 `NAXUS_TOKEN` 或受限 token 文件提供，不写进 Dockerfile、业务 manifest 或 Git。
 
@@ -129,13 +171,13 @@ docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
 
 运行层从固定摘要的 Alpine 提取 CA 证书、时区和静态 BusyBox 基础命令，与静态 musl 服务程序一起装入空白镜像。镜像不包含编译工具、客户端或开发账号，也不使用可执行压缩器。保留标准退出、信号和持久化语义。
 
-从源码构建：
+使用 `docker/Dockerfile.artifact` 装配镜像前，将目标架构对应的静态 musl 服务程序放到 `dist/naxus`。以 amd64 程序为例：
 
 ```sh
-docker build -f docker/Dockerfile -t naxus:local .
+docker build --platform linux/amd64 -f docker/Dockerfile.artifact -t naxus:1.0.0 .
 ```
 
-`docker/Dockerfile.artifact` 使用同一运行层，接收 `dist/naxus` 中对应目标平台的静态程序。发布流程将同一构建的程序同时放入 Linux 二进制归档与服务镜像，核对两者字节身份。提供 `linux/amd64` 和 `linux/arm64`；原生架构自动选择对应镜像。
+arm64 程序对应 `--platform linux/arm64`，不能只改变平台参数而复用另一个架构的二进制。发布流程将同一构建的程序同时放入 Linux 二进制归档与服务镜像，核对两者字节身份。提供 `linux/amd64` 和 `linux/arm64`；部署时自动选择对应平台，二进制归档说明见[交付文档](../docs/delivery.md#构建产物)。
 
 ## 备份与恢复
 

@@ -1873,8 +1873,8 @@ impl ApiError {
             );
         }
         if error
-            .downcast_ref::<rusqlite::Error>()
-            .is_some_and(|error| matches!(error, rusqlite::Error::QueryReturnedNoRows))
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(|error| matches!(error, sqlx::Error::RowNotFound))
         {
             Self::not_found()
         } else {

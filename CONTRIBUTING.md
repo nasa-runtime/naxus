@@ -2,7 +2,7 @@
 
 ## 环境与构建
 
-使用 Rust/Cargo 1.97 或更新版本，保留并提交 `Cargo.lock`。依赖来自 crates.io；工作区组件使用 path 与 version 并存的声明，源码归档仍由 Cargo 原生多包打包处理。
+使用 Rust/Cargo 1.97 或更新版本，保留并提交 `Cargo.lock`。依赖版本和功能开关以 workspace manifest 为准，构建时使用 `--locked` 保持依赖解析一致。
 
 ```sh
 cargo fmt --all --check
@@ -12,7 +12,9 @@ cargo doc --workspace --locked --no-deps
 cargo package --workspace --registry crates-io --locked
 ```
 
-库组件使用 Cargo 标准可发布声明，使原生多包打包能验证尚未发布的成员依赖；上述命令仅构建和生成归档，不上传 registry。公开发布由维护者通过相应仓库权限和凭据执行。GitHub CI 在 Linux、macOS 和最低支持工具链上执行格式、lint、构建、文档与源码归档检查。
+Cargo 源码归档按 registry 解析外部依赖。库组件使用 Cargo 标准可发布声明，使原生多包打包能处理同批成员依赖；打包不上传 registry，公开发布由维护者通过相应仓库权限和凭据执行。交付前直接核对归档内的 README、规范化 manifest、许可证、版本和文件清单，保证公开能力、配置与源码一致。
+
+GitHub CI 配置覆盖 Linux、macOS 和最低支持工具链的格式、lint、构建、文档与源码归档检查。二进制和镜像交付使用同一提交的产物，配置见[交付说明](docs/delivery.md)。
 
 反复打包相同开发版本时，为每次源码变化使用全新的 `cargo package --target-dir <新目录>`，避免 Cargo 临时 registry 的同版本解包缓存复用旧内容；不要改写或删除 Cargo 全局缓存来模拟开发覆盖。二进制和 Docker Hub 交付配置见[交付说明](docs/delivery.md)。
 
@@ -24,7 +26,7 @@ cargo package --workspace --registry crates-io --locked
 - 名称所有权与仓库策略不能在重复创建或同版本重发时被静默放宽。
 - 读取固定快照不能回到当前 HEAD，也不能用其他摘要替代缺失对象。
 
-新增或实质修改的业务函数使用中文说明业务作用、参数和返回语义。关键门禁解释设计原因及失败影响，保持注释与实际执行顺序一致。SQL 迁移采用描述业务含义的文件名。
+新增或实质修改的业务函数使用中文说明业务作用、参数和返回语义。关键门禁解释设计原因及失败影响，保持注释与实际执行顺序一致。业务 SQL 和结构迁移 SQL 均由 `statements.rs` 中的 Mapper trait 及 SQL 宏声明，不在调用方拼接或直接执行 SQL。
 
 公开能力、配置和失败行为变化时，同步维护中英文 README、组件说明与归档内容。源码归档采用显式 include 清单，不包含本地目录、凭据或构建缓存。
 

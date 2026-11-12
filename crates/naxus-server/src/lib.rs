@@ -20,7 +20,7 @@ use nasa::application::{
     ShutdownContext,
 };
 use naxus_core::ArtifactDigest;
-use naxus_store::{Store, StoreOptions};
+use naxus_store::Store;
 use tokio::sync::Semaphore;
 
 pub use config::bootstrap_loader;
@@ -48,7 +48,11 @@ pub(crate) struct ServerState {
     upstreams: Vec<Arc<upstream::UpstreamRuntime>>,
 }
 
-struct RepositoryInitialization(Arc<ServerState>);
+struct RepositoryInitialization {
+    state: Arc<ServerState>,
+    prepared: Option<naxus_store::PreparedStore>,
+    source: nasa::tx::sqlite::SqliteDataSource,
+}
 struct RepositoryResource(Arc<ServerState>);
 
 /// 业务作用：登记仓库资源和原始协议路由，不另行创建 listener、runtime 或信号所有者。
@@ -56,7 +60,7 @@ struct RepositoryResource(Arc<ServerState>);
 /// - `app`：NASA 尚未封口的应用容器。
 ///
 /// 返回：配置和路由登记成功后交给框架执行初始化；失败不开放业务请求。
-pub fn install(app: &Application) -> Result<()> {
+pub async fn install(app: &Application) -> Result<()> {
     let config: config::Config = app.config_section("naxus")?;
     let snapshot = app.config();
     let host = snapshot
@@ -65,6 +69,9 @@ pub fn install(app: &Application) -> Result<()> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("127.0.0.1");
     config.validate(host)?;
+    config::validate_datasource(snapshot.value(), &config)?;
+    let prepared = config::take_prepared(&config)?;
+    let source = app.sqlite_datasource("naxus").await?;
     let upstreams = config
         .proxies
         .iter()
@@ -101,7 +108,11 @@ pub fn install(app: &Application) -> Result<()> {
     http::install(app, state.clone())?;
     app.register_initializer(
         InitializerSpec::new("naxus-repositories").kind(InitializerKind::Hosted),
-        RepositoryInitialization(state),
+        RepositoryInitialization {
+            state,
+            prepared: Some(prepared),
+            source,
+        },
     )?;
     Ok(())
 }
@@ -117,22 +128,14 @@ impl Initialization for RepositoryInitialization {
         context: &'a mut InitializationContext<'_>,
     ) -> ApplicationFuture<'a> {
         Box::pin(async move {
-            let state = self.0.clone();
+            let state = self.state.clone();
+            let source = self.source.clone();
+            let prepared_root = self
+                .prepared
+                .take()
+                .ok_or_else(|| initialization_error("repository initialized twice"))?;
             let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
-                let options = StoreOptions {
-                    max_artifact_bytes: state
-                        .config
-                        .data
-                        .max_artifact_bytes
-                        .unwrap_or(256 * 1024 * 1024),
-                    reserve_free_bytes: state
-                        .config
-                        .data
-                        .hard_free_bytes
-                        .unwrap_or(2 * 1024 * 1024 * 1024),
-                    ..StoreOptions::default()
-                };
-                let store = Arc::new(Store::open(state.config.data_root()?, options)?);
+                let store = Arc::new(Store::open_managed(prepared_root, source)?);
                 for repository in &state.config.repositories {
                     store.create_repository(&repository.name, repository.policy)?;
                 }
@@ -146,15 +149,15 @@ impl Initialization for RepositoryInitialization {
             .await
             .map_err(initialization_error)?
             .map_err(initialization_error)?;
-            self.0
+            self.state
                 .store
                 .set(prepared.0)
                 .map_err(|_| initialization_error("repository initialized twice"))?;
-            self.0
+            self.state
                 .token
                 .set(prepared.1)
                 .map_err(|_| initialization_error("authentication initialized twice"))?;
-            self.0
+            self.state
                 .dummy_password
                 .set(prepared.2)
                 .map_err(|_| initialization_error("password verification initialized twice"))?;
@@ -186,15 +189,15 @@ impl Initialization for RepositoryInitialization {
                 "storage_initialized",
                 std::time::Instant::now(),
             );
-            self.0
+            self.state
                 .read_readiness
                 .set(read)
                 .map_err(|_| initialization_error("read readiness initialized twice"))?;
-            self.0
+            self.state
                 .write_readiness
                 .set(write)
                 .map_err(|_| initialization_error("write readiness initialized twice"))?;
-            context.register_managed_resource(None, RepositoryResource(self.0.clone()))?;
+            context.register_managed_resource(None, RepositoryResource(self.state.clone()))?;
             Ok(())
         })
     }
@@ -209,7 +212,7 @@ impl Initialization for RepositoryInitialization {
         context: &'a mut InitializationContext<'_>,
     ) -> ApplicationFuture<'a> {
         Box::pin(async move {
-            let state = self.0.clone();
+            let state = self.state.clone();
             context.stage_critical("maintenance", move |cancel| maintenance::run(state, cancel))
         })
     }

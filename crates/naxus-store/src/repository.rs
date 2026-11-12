@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
+use crate::database::{params, Connection, OptionalExtension, TransactionBehavior};
 use anyhow::{bail, ensure, Result};
 use naxus_core::{
     canonical_name, validate_name, ArtifactDigest, IndexEntry, RepositoryPolicy, Snapshot,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,6 +60,13 @@ pub struct RepositoryInfo {
     pub head: String,
 }
 
+/// Application 创建 SQLite owner 前已经取得的数据卷权威，不能复制或重复初始化。
+pub struct PreparedStore {
+    root: PathBuf,
+    options: StoreOptions,
+    instance_lock: Arc<InstanceLock>,
+}
+
 /// 独占数据卷的仓库存储；同步接口由调用者放入有界阻塞执行域。
 pub struct Store {
     pub(crate) root: PathBuf,
@@ -79,6 +86,16 @@ impl Store {
     ///
     /// 返回：文件系统受支持、数据库与对象一致才返回；已有实例、未知 schema 或对象缺失均拒绝启动。
     pub fn open(root: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        Self::initialize(Self::prepare(root, options)?, None)
+    }
+
+    /// 业务作用：在 Application 打开数据库前取得数据卷权威并准备私有文件，阻止旧实例并发操作。
+    /// 参数说明：
+    /// - `root`：实例独占的持久目录。
+    /// - `options`：对象、容量和数据库预算。
+    ///
+    /// 返回：持续持有实例锁的准备对象；未知文件系统、链接或冲突实例均拒绝。
+    pub fn prepare(root: impl AsRef<Path>, options: StoreOptions) -> Result<PreparedStore> {
         ensure!(
             options.max_artifact_bytes > 0 && options.max_snapshot_depth > 0,
             "invalid store limits"
@@ -87,7 +104,7 @@ impl Store {
         let root = root.as_ref().canonicalize()?;
         crate::filesystem::validate_filesystem(&root)?;
         // 数据库迁移和对象安装共享一个实例所有者，第二个进程不能绕过生命周期并发写同一卷。
-        let instance_lock = InstanceLock::acquire(&root)?;
+        let instance_lock = Arc::new(InstanceLock::acquire(&root)?);
         for directory in ["objects", "objects/sha256", "staging", "trash"] {
             let path = root.join(directory);
             fs::create_dir_all(&path)?;
@@ -100,20 +117,63 @@ impl Store {
         objects::sync_directory(&root.join("objects"))?;
         objects::sync_directory(&root)?;
         objects::recover_staging(&root)?;
-        let mut connection = Connection::open(root.join("naxus.sqlite3"))?;
-        connection.busy_timeout(options.busy_timeout)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        let schema: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        crate::database::protect_database(&root)?;
+        Ok(PreparedStore {
+            root,
+            options,
+            instance_lock,
+        })
+    }
+
+    /// 业务作用：将数据卷准备结果绑定到 Application 持有关闭责任的 SQLite 来源。
+    /// 参数说明：
+    /// - `prepared`：打开数据库前取得的实例权威。
+    /// - `source`：同一数据根上的受管 naxus 来源。
+    ///
+    /// 返回：完成 schema 升级及对象恢复的仓库；任何不一致拒绝开放。
+    pub fn open_managed(
+        prepared: PreparedStore,
+        source: nasa::tx::sqlite::SqliteDataSource,
+    ) -> Result<Self> {
+        // 对象引用只能提交到同一个数据卷，配置名称相同不能代替文件身份核对。
+        ensure!(
+            source.database_path().canonicalize()? == prepared.root.join("naxus.sqlite3")
+                && !source.is_read_only()
+                && source.capabilities().synchronous == 2
+                && source.capabilities().foreign_keys,
+            "managed repository datasource differs from the data volume contract"
+        );
+        Self::initialize(prepared, Some(source))
+    }
+
+    /// 业务作用：在固定来源中完成迁移、恢复及完整性检查后公开业务存储。
+    /// 参数说明：
+    /// - `prepared`：持有实例权威的数据卷。
+    /// - `source`：受管来源；缺失时由独立宿主持有 NASA owner。
+    ///
+    /// 返回：已验证存储；失败路径不公开业务句柄。
+    fn initialize(
+        prepared: PreparedStore,
+        source: Option<nasa::tx::sqlite::SqliteDataSource>,
+    ) -> Result<Self> {
+        let PreparedStore {
+            root,
+            options,
+            instance_lock,
+        } = prepared;
+        let mut connection = match source {
+            Some(source) => Connection::managed(source, instance_lock.clone())?,
+            None => Connection::open(&root, &options, instance_lock.clone())?,
+        };
+        let schema = crate::schema::revision(&connection)?;
         ensure!(schema <= 13, "unsupported repository schema");
         if schema == 0 {
             // 在同一事务提交 schema 与稳定身份，启动中断不能产生已迁移但身份缺失的仓库。
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/repository.sql"))?;
+            crate::schema::repository(&transaction)?;
             transaction.execute(
-                "INSERT INTO metadata(key, value) VALUES ('service_id', ?1)",
+                crate::statements::Statement::RepositoryOpenInsertMetadata,
                 [Uuid::new_v4().to_string()],
             )?;
             transaction.commit()?;
@@ -122,78 +182,78 @@ impl Store {
         if schema < 2 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/snapshot_checkpoints.sql"))?;
+            crate::schema::snapshot_checkpoints(&transaction)?;
             transaction.commit()?;
         }
         if schema < 3 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/publish_batches.sql"))?;
+            crate::schema::publish_batches(&transaction)?;
             transaction.commit()?;
         }
         if schema < 4 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/retention_leases.sql"))?;
+            crate::schema::retention_leases(&transaction)?;
             transaction.commit()?;
         }
         if schema < 5 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/proxy_cache.sql"))?;
+            crate::schema::proxy_cache(&transaction)?;
             transaction.commit()?;
         }
         if schema < 6 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/proxy_resolution.sql"))?;
+            crate::schema::proxy_resolution(&transaction)?;
             transaction.commit()?;
         }
         if schema < 7 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/access_control.sql"))?;
+            crate::schema::access_control(&transaction)?;
             transaction.commit()?;
         }
         if schema < 8 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/hosted_management.sql"))?;
+            crate::schema::hosted_management(&transaction)?;
             transaction.commit()?;
         }
         if schema < 9 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/object_lifecycle.sql"))?;
+            crate::schema::object_lifecycle(&transaction)?;
             transaction.commit()?;
         }
         if schema < 10 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/proxy_views.sql"))?;
+            crate::schema::proxy_views(&transaction)?;
             transaction.commit()?;
         }
         if schema < 11 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/deletion_retries.sql"))?;
+            crate::schema::deletion_retries(&transaction)?;
             transaction.commit()?;
         }
         if schema < 12 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/token_publish_scope.sql"))?;
+            crate::schema::token_publish_scope(&transaction)?;
             transaction.commit()?;
         }
         if schema < 13 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(include_str!("../migrations/unpublished_objects.sql"))?;
+            crate::schema::unpublished_objects(&transaction)?;
             transaction.commit()?;
         }
         let service_id = connection.query_row(
-            "SELECT value FROM metadata WHERE key = 'service_id'",
-            [],
+            crate::statements::Statement::RepositoryOpenQueryMetadata,
+            crate::database::params![],
             |row| row.get(0),
         )?;
         let store = Self {
@@ -201,7 +261,7 @@ impl Store {
             connection: Mutex::new(connection),
             object_gate: Mutex::new(()),
             options,
-            _instance_lock: Arc::new(instance_lock),
+            _instance_lock: instance_lock,
             readers: Arc::new(Mutex::new(BTreeMap::new())),
             service_id,
         };
@@ -236,7 +296,7 @@ impl Store {
         };
         let existing: Option<(String, String)> = transaction
             .query_row(
-                "SELECT policy, head FROM repositories WHERE name = ?1",
+                crate::statements::Statement::RepositoryCreateRepositoryQueryRepositories,
                 [name],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -256,11 +316,14 @@ impl Store {
             manifest_sha256: ArtifactDigest::of(b"[]"),
         };
         transaction.execute(
-            "INSERT INTO repositories(id, name, policy, head) VALUES (?1, ?2, ?3, ?4)",
+            crate::statements::Statement::RepositoryCreateRepositoryInsertRepositories,
             params![snapshot.repository_id, name, policy_text, snapshot.id],
         )?;
         insert_snapshot(&transaction, &snapshot)?;
-        transaction.execute("INSERT INTO audit(actor, action, repository_id, snapshot_id) VALUES ('system', 'create_repository', ?1, ?2)", params![snapshot.repository_id, snapshot.id])?;
+        transaction.execute(
+            crate::statements::Statement::RepositoryCreateRepositoryInsertAudit,
+            params![snapshot.repository_id, snapshot.id],
+        )?;
         transaction.commit()?;
         Ok(snapshot)
     }
@@ -317,7 +380,7 @@ impl Store {
                 let state: Option<String> = self
                     .connection()?
                     .query_row(
-                        "SELECT state FROM objects WHERE sha256 = ?1",
+                        crate::statements::Statement::RepositoryInstallValidatedQueryObjects,
                         [expected.as_str()],
                         |row| row.get(0),
                     )
@@ -329,7 +392,10 @@ impl Store {
                 Ok(())
             },
             |object| {
-                self.connection()?.execute("INSERT INTO objects(sha256, size, installed_at) VALUES (?1, ?2, unixepoch()) ON CONFLICT(sha256) DO UPDATE SET size = excluded.size, generation = CASE WHEN objects.state = 'purged' THEN objects.generation + 1 ELSE objects.generation END, state = 'present', installed_at = unixepoch()", params![object.sha256.as_str(), object.size])?;
+                self.connection()?.execute(
+                    crate::statements::Statement::RepositoryInstallValidatedInsertObjects,
+                    params![object.sha256.as_str(), object.size],
+                )?;
                 Ok(())
             },
         )
@@ -409,7 +475,7 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (repository_id, policy, head): (String, String, String) = transaction.query_row(
-            "SELECT id, policy, head FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::RepositoryCommitInnerQueryRepositories,
             [&request.repository],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -428,7 +494,7 @@ impl Store {
                 crate::RepositoryFailure::Forbidden("publish token permission denied")
             );
             let (overwrite, crates): (bool, String) = transaction.query_row(
-                "SELECT allow_overwrite, publish_crates FROM access_tokens WHERE digest = ?1",
+                crate::statements::Statement::RepositoryCommitInnerQueryAccessTokens,
                 [token.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -438,7 +504,7 @@ impl Store {
         };
         for digest in object_sizes.keys() {
             let state: String = transaction.query_row(
-                "SELECT state FROM objects WHERE sha256 = ?1",
+                crate::statements::Statement::RepositoryCommitInnerQueryObjects,
                 [digest.as_str()],
                 |row| row.get(0),
             )?;
@@ -450,7 +516,13 @@ impl Store {
                 )
             );
         }
-        let existing: Option<(String, String)> = transaction.query_row("SELECT request_sha256, snapshot_id FROM commits WHERE repository_id = ?1 AND idempotency_key = ?2", params![repository_id, request.idempotency_key], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                crate::statements::Statement::RepositoryCommitInnerQueryCommits,
+                params![repository_id, request.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         if let Some((digest, snapshot)) = existing {
             ensure!(
                 digest == request_digest.as_str(),
@@ -471,7 +543,7 @@ impl Store {
             let canonical = canonical_name(&entry.name);
             let owner: Option<String> = transaction
                 .query_row(
-                    "SELECT name FROM crate_names WHERE repository_id = ?1 AND canonical = ?2",
+                    crate::statements::Statement::RepositoryCommitInnerQueryCrateNames,
                     params![repository_id, canonical],
                     |row| row.get(0),
                 )
@@ -495,7 +567,11 @@ impl Store {
                     crate::RepositoryFailure::Forbidden("crate publish scope permission denied")
                 );
                 if current.as_ref().is_none_or(|current| current != entry) {
-                    let existed: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM revisions WHERE repository_id = ?1 AND name = ?2 AND version = ?3)", params![repository_id, entry.name, entry.vers], |row| row.get(0))?;
+                    let existed: bool = transaction.query_row(
+                        crate::statements::Statement::RepositoryCommitInnerQueryRevisions,
+                        params![repository_id, entry.name, entry.vers],
+                        |row| row.get(0),
+                    )?;
                     // 历史坐标也不是首次发布，逻辑移除不能让普通发布权限隐含获得覆盖或重新开放权。
                     ensure!(
                         !existed || *overwrite,
@@ -506,7 +582,13 @@ impl Store {
                 }
             }
             if current.is_none() && policy == "immutable" {
-                let previous: Option<String> = transaction.query_row("SELECT entry_json FROM revisions WHERE repository_id = ?1 AND name = ?2 AND version = ?3 LIMIT 1", params![repository_id, entry.name, entry.vers], |row| row.get(0)).optional()?;
+                let previous: Option<String> = transaction
+                    .query_row(
+                        crate::statements::Statement::RepositoryCommitInnerQueryRevisions2,
+                        params![repository_id, entry.name, entry.vers],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
                 if let Some(previous) = previous {
                     let mut previous: IndexEntry = serde_json::from_str(&previous)?;
                     let mut candidate = (*entry).clone();
@@ -537,14 +619,29 @@ impl Store {
                     )
                 );
             }
-            transaction.execute("INSERT OR IGNORE INTO crate_names(repository_id, canonical, name) VALUES (?1, ?2, ?3)", params![repository_id, canonical, entry.name])?;
             transaction.execute(
-                "INSERT OR IGNORE INTO objects(sha256, size) VALUES (?1, ?2)",
+                crate::statements::Statement::RepositoryCommitInnerInsertCrateNames,
+                params![repository_id, canonical, entry.name],
+            )?;
+            transaction.execute(
+                crate::statements::Statement::RepositoryCommitInnerInsertObjects,
                 params![entry.cksum.as_str(), object_sizes[&entry.cksum]],
             )?;
             let revision_id = Uuid::new_v4().to_string();
             let metadata = entry.metadata_digest()?;
-            transaction.execute("INSERT INTO revisions(id, repository_id, name, version, sha256, metadata_sha256, entry_json, actor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![revision_id, repository_id, entry.name, entry.vers, entry.cksum.as_str(), metadata.as_str(), serde_json::to_string(entry)?, request.actor])?;
+            transaction.execute(
+                crate::statements::Statement::RepositoryCommitInnerInsertRevisions,
+                params![
+                    revision_id,
+                    repository_id,
+                    entry.name,
+                    entry.vers,
+                    entry.cksum.as_str(),
+                    metadata.as_str(),
+                    serde_json::to_string(entry)?,
+                    request.actor
+                ],
+            )?;
             changes.push((
                 entry.name.clone(),
                 entry.vers.clone(),
@@ -567,21 +664,45 @@ impl Store {
             };
             insert_snapshot(&transaction, &snapshot)?;
             for (name, version, revision_id, _) in changes {
-                transaction.execute("INSERT INTO snapshot_changes(snapshot_id, name, version, revision_id) VALUES (?1, ?2, ?3, ?4)", params![snapshot.id, name, version, revision_id])?;
+                transaction.execute(
+                    crate::statements::Statement::RepositoryCommitInnerInsertSnapshotChanges,
+                    params![snapshot.id, name, version, revision_id],
+                )?;
             }
             // 周期性保存等价读取检查点，把长期发布的父链成本限制在固定窗口内。
             materialize_checkpoint(&transaction, &snapshot.id, self.options.max_snapshot_depth)?;
             // 所有修订与快照变更已经进入同一事务，最后才发布新的当前入口。
             transaction.execute(
-                "UPDATE repositories SET head = ?1 WHERE id = ?2 AND head = ?3",
+                crate::statements::Statement::RepositoryCommitInnerUpdateRepositories,
                 params![snapshot.id, repository_id, head],
             )?;
             snapshot
         };
-        transaction.execute("INSERT INTO commits(repository_id, idempotency_key, request_sha256, snapshot_id, actor) VALUES (?1, ?2, ?3, ?4, ?5)", params![repository_id, request.idempotency_key, request_digest.as_str(), snapshot.id, request.actor])?;
-        transaction.execute("INSERT INTO audit(actor, action, repository_id, snapshot_id) VALUES (?1, 'commit', ?2, ?3)", params![request.actor, repository_id, snapshot.id])?;
+        transaction.execute(
+            crate::statements::Statement::RepositoryCommitInnerInsertCommits,
+            params![
+                repository_id,
+                request.idempotency_key,
+                request_digest.as_str(),
+                snapshot.id,
+                request.actor
+            ],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::RepositoryCommitInnerInsertAudit,
+            params![request.actor, repository_id, snapshot.id],
+        )?;
         if let Some(batch) = batch {
-            let changed = transaction.execute("UPDATE publish_batches SET state = 'committed', snapshot_id = ?1 WHERE id = ?2 AND repository_id = ?3 AND actor = ?4 AND expected_head = ?5 AND state = 'validating'", params![snapshot.id, batch, repository_id, request.actor, request.expected_head])?;
+            let changed = transaction.execute(
+                crate::statements::Statement::RepositoryCommitInnerUpdatePublishBatches,
+                params![
+                    snapshot.id,
+                    batch,
+                    repository_id,
+                    request.actor,
+                    request.expected_head
+                ],
+            )?;
             ensure!(
                 changed == 1,
                 crate::RepositoryFailure::Conflict("publish batch authority changed".to_owned())
@@ -600,7 +721,7 @@ impl Store {
     pub fn head(&self, repository: &str) -> Result<Snapshot> {
         let connection = self.connection()?;
         let head: String = connection.query_row(
-            "SELECT head FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::RepositoryHeadQueryRepositories,
             [repository],
             |row| row.get(0),
         )?;
@@ -632,9 +753,9 @@ impl Store {
     /// 返回：按名称排序的仓库描述，不隐式合并同名包来源。
     pub fn repositories(&self) -> Result<Vec<RepositoryInfo>> {
         let connection = self.connection()?;
-        let mut statement =
-            connection.prepare("SELECT id, name, policy, head FROM repositories ORDER BY name")?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = connection
+            .prepare(crate::statements::Statement::RepositoryRepositoriesQueryRepositories)?;
+        let rows = statement.query_map(crate::database::params![], |row| {
             let policy: String = row.get(2)?;
             Ok(RepositoryInfo {
                 id: row.get(0)?,
@@ -647,7 +768,7 @@ impl Store {
                 head: row.get(3)?,
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(rows.collect::<sqlx::Result<Vec<_>>>()?)
     }
 
     /// 业务作用：复验固定快照属于请求仓库，防止跨仓库 UUID 被用于读取其他来源。
@@ -659,7 +780,7 @@ impl Store {
     pub fn snapshot(&self, repository: &str, snapshot: &str) -> Result<Snapshot> {
         let connection = self.connection()?;
         let repository_id: String = connection.query_row(
-            "SELECT id FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::RepositorySnapshotQueryRepositories,
             [repository],
             |row| row.get(0),
         )?;
@@ -683,7 +804,7 @@ impl Store {
         let repository_id = read_snapshot(&connection, snapshot)?.repository_id;
         let actual_name: Option<String> = connection
             .query_row(
-                "SELECT name FROM crate_names WHERE repository_id = ?1 AND canonical = ?2",
+                crate::statements::Statement::RepositoryIndexEntriesQueryCrateNames,
                 params![repository_id, canonical_name(name)],
                 |row| row.get(0),
             )
@@ -691,12 +812,11 @@ impl Store {
         let Some(name) = actual_name else {
             return Ok(Vec::new());
         };
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT version FROM revisions WHERE repository_id = ?1 AND name = ?2",
-        )?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::RepositoryIndexEntriesQueryRevisions)?;
         let versions = statement
             .query_map(params![repository_id, name], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         let mut entries = Vec::new();
         for version in versions {
             if let Some(entry) = read_entry(
@@ -725,16 +845,18 @@ impl Store {
         let connection = self.connection()?;
         // 摘要路由表达同仓任一有效正式引用；一个历史撤销不能越过仍有效的共享引用。
         let available: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revisions v JOIN repositories r ON r.id = v.repository_id
-             WHERE (r.name = ?1 OR r.id = ?1) AND v.sha256 = ?2
-               AND NOT EXISTS(SELECT 1 FROM artifact_access_revocations a WHERE a.revision_id = v.id))",
+            crate::statements::Statement::RepositoryContainsObjectQueryRevisions,
             params![repository, digest.as_str()],
             |row| row.get(0),
         )?;
         if available {
             return Ok(true);
         }
-        let revoked: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifact_access_revocations a JOIN revisions v ON v.id = a.revision_id JOIN repositories r ON r.id = v.repository_id WHERE (r.name = ?1 OR r.id = ?1) AND v.sha256 = ?2)", params![repository, digest.as_str()], |row| row.get(0))?;
+        let revoked: bool = connection.query_row(
+            crate::statements::Statement::RepositoryContainsObjectQueryArtifactAccessRevocations,
+            params![repository, digest.as_str()],
+            |row| row.get(0),
+        )?;
         if revoked {
             return Err(crate::ArtifactGone.into());
         }
@@ -798,7 +920,11 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("object lifecycle unavailable"))?;
         {
             let connection = self.connection()?;
-            let allowed: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM snapshots s JOIN repositories r ON r.id = s.repository_id WHERE s.id = ?1 AND (r.id = ?2 OR r.name = ?2))", params![snapshot, repository], |row| row.get(0))?;
+            let allowed: bool = connection.query_row(
+                crate::statements::Statement::RepositoryOpenSnapshotObjectQuerySnapshots,
+                params![snapshot, repository],
+                |row| row.get(0),
+            )?;
             ensure!(
                 allowed,
                 crate::RepositoryFailure::Forbidden("snapshot belongs to a different repository")
@@ -815,7 +941,7 @@ impl Store {
                 "snapshot object checksum differs"
             );
             let revoked: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM artifact_access_revocations WHERE revision_id = ?1)",
+                crate::statements::Statement::RepositoryOpenSnapshotObjectQueryArtifactAccessRevocations,
                 [revision.id],
                 |row| row.get(0),
             )?;
@@ -835,7 +961,7 @@ impl Store {
         let state: Option<String> = self
             .connection()?
             .query_row(
-                "SELECT state FROM objects WHERE sha256 = ?1",
+                crate::statements::Statement::RepositoryOpenReaderQueryObjects,
                 [digest.as_str()],
                 |row| row.get(0),
             )
@@ -867,30 +993,26 @@ impl Store {
     /// 返回：引用完整且所有受保护对象摘要正确时成功；未经授权的缺失或损坏拒绝就绪。
     pub fn check_integrity(&self) -> Result<()> {
         let connection = self.connection()?;
-        let status: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        ensure!(status == "ok", "repository database integrity check failed");
-        let foreign_failure: Option<String> = connection
-            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
-            .optional()?;
-        ensure!(
-            foreign_failure.is_none(),
-            "repository foreign key check failed"
-        );
+        connection.inspect()?;
         let invalid_scope: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM repositories r LEFT JOIN snapshots s ON s.id = r.head WHERE s.id IS NULL OR s.repository_id <> r.id) OR EXISTS(SELECT 1 FROM snapshots s JOIN snapshots p ON p.id = s.parent_id WHERE s.repository_id <> p.repository_id) OR EXISTS(SELECT 1 FROM snapshot_changes c JOIN snapshots s ON s.id = c.snapshot_id JOIN revisions r ON r.id = c.revision_id WHERE r.repository_id <> s.repository_id OR r.name <> c.name OR r.version <> c.version) OR EXISTS(SELECT 1 FROM checkpoint_entries c JOIN snapshots s ON s.id = c.snapshot_id JOIN revisions r ON r.id = c.revision_id WHERE r.repository_id <> s.repository_id OR r.name <> c.name OR r.version <> c.version)",
-            [],
+            crate::statements::Statement::RepositoryCheckIntegrityQueryRepositories,
+            crate::database::params![],
             |row| row.get(0),
         )?;
         // SQL 外键只证明记录存在，归属和坐标仍须复验，避免合法行被错误拼成跨仓库读取图。
         ensure!(!invalid_scope, "repository reference scope mismatch");
-        let invalid_lifecycle: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM revisions r JOIN objects o ON o.sha256 = r.sha256 WHERE o.state != 'present' AND NOT EXISTS(SELECT 1 FROM artifact_access_revocations a WHERE a.revision_id = r.id)) OR EXISTS(SELECT 1 FROM proxy_objects p JOIN objects o ON o.sha256 = p.digest WHERE o.state != 'present') OR EXISTS(SELECT 1 FROM proxy_materializations m JOIN materialization_items i ON i.materialization_id = m.id WHERE m.valid = 1 AND NOT EXISTS(SELECT 1 FROM proxy_objects p JOIN objects o ON o.sha256 = p.digest WHERE p.proxy_id = m.proxy_id AND p.digest = i.digest AND o.state = 'present'))", [], |row| row.get(0))?;
+        let invalid_lifecycle: bool = connection.query_row(
+            crate::statements::Statement::RepositoryCheckIntegrityQueryRevisions,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         ensure!(
             !invalid_lifecycle,
             "live object references differ from storage lifecycle"
         );
-        let mut statement =
-            connection.prepare("SELECT sha256, size, state, generation FROM objects")?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = connection
+            .prepare(crate::statements::Statement::RepositoryCheckIntegrityQueryObjects)?;
+        let rows = statement.query_map(crate::database::params![], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, u64>(1)?,
@@ -903,7 +1025,11 @@ impl Store {
             if state == "present" {
                 objects::verify_object(&self.root, &digest.parse()?, Some(size))?;
             } else {
-                let authorized: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM deletion_items i JOIN object_deletions d ON d.id = i.deletion_id WHERE i.digest = ?1 AND i.generation = ?2 AND i.state = 'purged' AND d.state = 'completed')", params![digest, generation], |row| row.get(0))?;
+                let authorized: bool = connection.query_row(
+                    crate::statements::Statement::RepositoryCheckIntegrityQueryDeletionItems,
+                    params![digest, generation],
+                    |row| row.get(0),
+                )?;
                 // 文件缺失只有在匹配的代次清除任务完成后才是合法状态，不能掩盖未经授权的数据丢失。
                 ensure!(
                     state == "purged" && authorized,
@@ -912,8 +1038,8 @@ impl Store {
             }
         }
         let mut statement = connection
-            .prepare("SELECT name, version, sha256, metadata_sha256, entry_json FROM revisions")?;
-        let rows = statement.query_map([], |row| {
+            .prepare(crate::statements::Statement::RepositoryCheckIntegrityQueryRevisions2)?;
+        let rows = statement.query_map(crate::database::params![], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -956,7 +1082,15 @@ impl Store {
 ///
 /// 返回：写入成功；重复身份或引用冲突返回错误，不覆盖原有记录。
 pub(crate) fn insert_snapshot(connection: &Connection, snapshot: &Snapshot) -> Result<()> {
-    connection.execute("INSERT INTO snapshots(id, repository_id, parent_id, manifest_sha256) VALUES (?1, ?2, ?3, ?4)", params![snapshot.id, snapshot.repository_id, snapshot.parent_id, snapshot.manifest_sha256.as_str()])?;
+    connection.execute(
+        crate::statements::Statement::RepositoryInsertSnapshotInsertSnapshots,
+        params![
+            snapshot.id,
+            snapshot.repository_id,
+            snapshot.parent_id,
+            snapshot.manifest_sha256.as_str()
+        ],
+    )?;
     Ok(())
 }
 
@@ -969,7 +1103,7 @@ pub(crate) fn insert_snapshot(connection: &Connection, snapshot: &Snapshot) -> R
 pub(crate) fn read_snapshot(connection: &Connection, id: &str) -> Result<Snapshot> {
     let (repository_id, parent_id, digest): (String, Option<String>, String) = connection
         .query_row(
-            "SELECT repository_id, parent_id, manifest_sha256 FROM snapshots WHERE id = ?1",
+            crate::statements::Statement::RepositoryReadSnapshotQuerySnapshots,
             [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -1010,11 +1144,21 @@ pub(crate) fn read_entry(
             snapshot.repository_id == repository_id,
             "snapshot lineage crosses repositories"
         );
-        let removed: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM snapshot_removals WHERE snapshot_id = ?1 AND name = ?2 AND version = ?3)", params![id, name, version], |row| row.get(0))?;
+        let removed: bool = connection.query_row(
+            crate::statements::Statement::RepositoryReadEntryQuerySnapshotRemovals,
+            params![id, name, version],
+            |row| row.get(0),
+        )?;
         if removed {
             return Ok(None);
         }
-        let json: Option<String> = connection.query_row("SELECT r.entry_json FROM snapshot_changes c JOIN revisions r ON r.id = c.revision_id WHERE c.snapshot_id = ?1 AND c.name = ?2 AND c.version = ?3 AND r.repository_id = ?4", params![id, name, version, repository_id], |row| row.get(0)).optional()?;
+        let json: Option<String> = connection
+            .query_row(
+                crate::statements::Statement::RepositoryReadEntryQuerySnapshotChanges,
+                params![id, name, version, repository_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(json) = json {
             let entry: IndexEntry = serde_json::from_str(&json)?;
             entry.validate()?;
@@ -1025,12 +1169,18 @@ pub(crate) fn read_entry(
             return Ok(Some(entry));
         }
         let checkpoint: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshot_checkpoints WHERE snapshot_id = ?1)",
+            crate::statements::Statement::RepositoryReadEntryQuerySnapshotCheckpoints,
             [&id],
             |row| row.get(0),
         )?;
         if checkpoint {
-            let json: Option<String> = connection.query_row("SELECT r.entry_json FROM checkpoint_entries c JOIN revisions r ON r.id = c.revision_id WHERE c.snapshot_id = ?1 AND c.name = ?2 AND c.version = ?3 AND r.repository_id = ?4", params![id, name, version, repository_id], |row| row.get(0)).optional()?;
+            let json: Option<String> = connection
+                .query_row(
+                    crate::statements::Statement::RepositoryReadEntryQueryCheckpointEntries,
+                    params![id, name, version, repository_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             return json
                 .map(|json| {
                     let entry: IndexEntry = serde_json::from_str(&json)?;
@@ -1069,8 +1219,9 @@ pub(crate) fn materialize_checkpoint(
     let mut depth = 0;
     while let Some(id) = current {
         depth += 1;
-        let mut statement = connection
-            .prepare("SELECT name, version FROM snapshot_removals WHERE snapshot_id = ?1")?;
+        let mut statement = connection.prepare(
+            crate::statements::Statement::RepositoryMaterializeCheckpointQuerySnapshotRemovals,
+        )?;
         let removals = statement.query_map([&id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1078,7 +1229,7 @@ pub(crate) fn materialize_checkpoint(
             visible.entry(removal?).or_insert(None);
         }
         let mut statement = connection.prepare(
-            "SELECT name, version, revision_id FROM snapshot_changes WHERE snapshot_id = ?1",
+            crate::statements::Statement::RepositoryMaterializeCheckpointQuerySnapshotChanges,
         )?;
         let changes = statement.query_map([&id], |row| {
             Ok((
@@ -1092,7 +1243,7 @@ pub(crate) fn materialize_checkpoint(
             visible.entry((name, version)).or_insert(Some(revision));
         }
         let checkpoint: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshot_checkpoints WHERE snapshot_id = ?1)",
+            crate::statements::Statement::RepositoryMaterializeCheckpointQuerySnapshotCheckpoints,
             [&id],
             |row| row.get(0),
         )?;
@@ -1101,7 +1252,7 @@ pub(crate) fn materialize_checkpoint(
                 return Ok(());
             }
             let mut statement = connection.prepare(
-                "SELECT name, version, revision_id FROM checkpoint_entries WHERE snapshot_id = ?1",
+                crate::statements::Statement::RepositoryMaterializeCheckpointQueryCheckpointEntries,
             )?;
             let rows = statement.query_map([&id], |row| {
                 Ok((
@@ -1123,12 +1274,12 @@ pub(crate) fn materialize_checkpoint(
     }
     for ((name, version), revision) in visible {
         if let Some(revision) = revision {
-            connection.execute("INSERT INTO checkpoint_entries(snapshot_id, name, version, revision_id) VALUES (?1, ?2, ?3, ?4)", params![snapshot, name, version, revision])?;
+            connection.execute(crate::statements::Statement::RepositoryMaterializeCheckpointInsertCheckpointEntries, params![snapshot, name, version, revision])?;
         }
     }
     // 标记只在完整映射进入同一事务后写入；读者不能把半份检查点当成完整快照。
     connection.execute(
-        "INSERT INTO snapshot_checkpoints(snapshot_id) VALUES (?1)",
+        crate::statements::Statement::RepositoryMaterializeCheckpointInsertSnapshotCheckpoints,
         [snapshot],
     )?;
     Ok(())

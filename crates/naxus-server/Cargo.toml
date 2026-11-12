@@ -19,13 +19,13 @@ axum.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
 hyper.workspace = true
-nasa.workspace = true
-naxus-core = { version = "1.0.0", path = "../naxus-core" }
-naxus-store = { version = "1.0.0", path = "../naxus-store" }
-naxus-registry = { version = "1.0.0", path = "../naxus-registry" }
+nasa = { workspace = true, features = ["application", "web-auth", "yml", "log", "secret", "crypto"] }
+naxus-core = "1.0.0"
+naxus-store = "1.0.0"
+naxus-registry = "1.0.0"
 reqwest.workspace = true
 rustls.workspace = true
-rusqlite.workspace = true
+sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true

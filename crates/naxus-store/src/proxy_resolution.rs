@@ -1,6 +1,6 @@
+use crate::database::{params, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Context, Result};
 use naxus_core::{ArtifactDigest, IndexEntry};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -48,11 +48,11 @@ impl Store {
     ///
     /// 返回：公开集合未被主动撤销时为 true，团队可共享已提交的锁文件证据。
     pub fn materialization_valid(&self, id: &str) -> Result<bool> {
-        Ok(self.connection()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proxy_materializations WHERE id = ?1 AND valid = 1)",
+        self.connection()?.query_row(
+            crate::statements::Statement::ProxyResolutionMaterializationValidQueryProxyMaterializations,
             [id],
             |row| row.get(0),
-        )?)
+        )
     }
     /// 业务作用：为客户端解析创建有界短期视图，固定条目而非修改 Cargo 来源身份。
     /// 参数说明：
@@ -95,9 +95,12 @@ impl Store {
         );
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM proxy_sessions WHERE id IN (SELECT id FROM proxy_sessions WHERE expires_at <= unixepoch() LIMIT 256)", [])?;
+        transaction.execute(
+            crate::statements::Statement::ProxyResolutionBeginProxyViewDeleteProxySessions,
+            crate::database::params![],
+        )?;
         let (total, owned): (u64, u64) = transaction.query_row(
-            "SELECT count(*), coalesce(sum(actor = ?1), 0) FROM proxy_sessions",
+            crate::statements::Statement::ProxyResolutionBeginProxyViewQueryProxySessions,
             [actor],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -106,12 +109,15 @@ impl Store {
             crate::ResourceLimitExceeded("proxy session budget exceeded")
         );
         let proxy_id: String = transaction.query_row(
-            "SELECT id FROM proxy_repositories WHERE name = ?1",
+            crate::statements::Statement::ProxyResolutionBeginProxyViewQueryProxyRepositories,
             [proxy],
             |row| row.get(0),
         )?;
-        let expires_at =
-            transaction.query_row("SELECT unixepoch() + 3600", [], |row| row.get(0))?;
+        let expires_at = transaction.query_row(
+            crate::statements::Statement::ProxyResolutionBeginProxyViewQueryValue,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         let session = ProxySession {
             id: Uuid::new_v4().to_string(),
             proxy: proxy.to_owned(),
@@ -120,7 +126,17 @@ impl Store {
             expires_at,
             upstream_start,
         };
-        transaction.execute("INSERT INTO proxy_sessions(id, proxy_id, actor, mode, expires_at, upstream_start) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![session.id, session.proxy_id, actor, session.mode, session.expires_at, upstream_start])?;
+        transaction.execute(
+            crate::statements::Statement::ProxyResolutionBeginProxyViewInsertProxySessions,
+            params![
+                session.id,
+                session.proxy_id,
+                actor,
+                session.mode,
+                session.expires_at,
+                upstream_start
+            ],
+        )?;
         transaction.commit()?;
         Ok(session)
     }
@@ -136,9 +152,7 @@ impl Store {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT s.id, p.name, p.id, s.mode, s.expires_at, s.upstream_start
-             FROM proxy_sessions s JOIN proxy_repositories p ON p.id = s.proxy_id
-             WHERE s.id = ?1 AND p.name = ?2 AND s.actor = ?3 AND s.expires_at > unixepoch()",
+                crate::statements::Statement::ProxyResolutionProxySessionQueryProxySessions,
                 params![id, proxy, actor],
                 |row| {
                     Ok(ProxySession {
@@ -168,14 +182,14 @@ impl Store {
         session: &ProxySession,
         name: &str,
     ) -> Result<Option<Vec<u8>>> {
-        Ok(self
+        self
             .connection()?
             .query_row(
-                "SELECT body FROM proxy_session_entries WHERE session_id = ?1 AND name = ?2",
+                crate::statements::Statement::ProxyResolutionProxySessionEntryQueryProxySessionEntries,
                 params![session.id, name],
                 |row| row.get(0),
             )
-            .optional()?)
+            .optional()
     }
 
     /// 业务作用：以首次返回的索引固定本次视图，竞争读取只接受已先提交的同一内容。
@@ -193,14 +207,18 @@ impl Store {
     ) -> Result<Vec<u8>> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM proxy_sessions WHERE id = ?1 AND expires_at > unixepoch())", [&session.id], |row| row.get(0))?;
+        let active: bool = transaction.query_row(
+            crate::statements::Statement::ProxyResolutionFreezeProxyEntryQueryProxySessions,
+            [&session.id],
+            |row| row.get(0),
+        )?;
         ensure!(
             active,
             crate::RepositoryFailure::NotFound("proxy session is unavailable")
         );
         let existing: Option<Vec<u8>> = transaction
             .query_row(
-                "SELECT body FROM proxy_session_entries WHERE session_id = ?1 AND name = ?2",
+                crate::statements::Statement::ProxyResolutionFreezeProxyEntryQueryProxySessionEntries,
                 params![session.id, name],
                 |row| row.get(0),
             )
@@ -217,14 +235,21 @@ impl Store {
                     .saturating_add((body.len() as u64).saturating_mul(8)),
             crate::RepositoryFailure::InsufficientStorage
         );
-        let (count, bytes): (u64, u64) = transaction.query_row("SELECT count(*), coalesce(sum(length(body)), 0) FROM proxy_session_entries WHERE session_id = ?1", [&session.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (count, bytes): (u64, u64) = transaction.query_row(
+            crate::statements::Statement::ProxyResolutionFreezeProxyEntryQueryProxySessionEntries2,
+            [&session.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         ensure!(
             count < 4096 && bytes.saturating_add(body.len() as u64) <= 512 * 1024 * 1024,
             crate::ResourceLimitExceeded("proxy session index budget exceeded")
         );
-        transaction.execute("INSERT OR IGNORE INTO proxy_session_entries(session_id, name, body) VALUES (?1, ?2, ?3)", params![session.id, name, body])?;
+        transaction.execute(
+            crate::statements::Statement::ProxyResolutionFreezeProxyEntryInsertProxySessionEntries,
+            params![session.id, name, body],
+        )?;
         let fixed: Vec<u8> = transaction.query_row(
-            "SELECT body FROM proxy_session_entries WHERE session_id = ?1 AND name = ?2",
+            crate::statements::Statement::ProxyResolutionFreezeProxyEntryQueryProxySessionEntries3,
             params![session.id, name],
             |row| row.get(0),
         )?;
@@ -233,7 +258,7 @@ impl Store {
             .filter(|line| !line.is_empty())
         {
             let entry: IndexEntry = serde_json::from_slice(line)?;
-            transaction.execute("INSERT OR IGNORE INTO proxy_session_objects(session_id, name, digest) VALUES (?1, ?2, ?3)", params![session.id, name, entry.cksum.as_str()])?;
+            transaction.execute(crate::statements::Statement::ProxyResolutionFreezeProxyEntryInsertProxySessionObjects, params![session.id, name, entry.cksum.as_str()])?;
         }
         transaction.commit()?;
         Ok(fixed)
@@ -245,8 +270,10 @@ impl Store {
     ///
     /// 返回：删除短期固定索引，不删除制品对象。
     pub fn finish_proxy_session(&self, session: &ProxySession) -> Result<()> {
-        self.connection()?
-            .execute("DELETE FROM proxy_sessions WHERE id = ?1", [&session.id])?;
+        self.connection()?.execute(
+            crate::statements::Statement::ProxyResolutionFinishProxySessionDeleteProxySessions,
+            [&session.id],
+        )?;
         Ok(())
     }
 
@@ -264,11 +291,9 @@ impl Store {
         upstream: &str,
     ) -> Result<Option<UpstreamValidation>> {
         let connection = self.connection()?;
-        Ok(connection
+        connection
             .query_row(
-                "SELECT etag, modified, body FROM proxy_validators
-             WHERE proxy_id = (SELECT id FROM proxy_repositories WHERE name = ?1)
-               AND name = ?2 AND upstream = ?3",
+                crate::statements::Statement::ProxyResolutionUpstreamValidationQueryProxyValidators,
                 params![proxy, name, upstream],
                 |row| {
                     Ok(UpstreamValidation {
@@ -278,7 +303,7 @@ impl Store {
                     })
                 },
             )
-            .optional()?)
+            .optional()
     }
 
     /// 业务作用：仅在索引通过校验后保存同一镜像的条件请求标记。
@@ -307,7 +332,7 @@ impl Store {
                     .is_none_or(|value| value.len() <= 4096),
             "upstream validator exceeds limit"
         );
-        self.connection()?.execute("INSERT INTO proxy_validators(proxy_id, name, upstream, etag, modified, body) SELECT id, ?2, ?3, ?4, ?5, ?6 FROM proxy_repositories WHERE name = ?1 ON CONFLICT(proxy_id, name, upstream) DO UPDATE SET etag = excluded.etag, modified = excluded.modified, body = excluded.body", params![proxy, name, upstream, validation.etag, validation.modified, validation.body])?;
+        self.connection()?.execute(crate::statements::Statement::ProxyResolutionSaveUpstreamValidationInsertProxyValidators, params![proxy, name, upstream, validation.etag, validation.modified, validation.body])?;
         Ok(())
     }
 
@@ -318,7 +343,11 @@ impl Store {
     ///
     /// 返回：仍有效的明确缺失证据是否存在。
     pub fn proxy_missing(&self, proxy: &str, name: &str) -> Result<bool> {
-        Ok(self.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM proxy_missing WHERE proxy_id = (SELECT id FROM proxy_repositories WHERE name = ?1) AND name = ?2 AND expires_at > unixepoch())", params![proxy, name], |row| row.get(0))?)
+        self.connection()?.query_row(
+            crate::statements::Statement::ProxyResolutionProxyMissingQueryProxyMissing,
+            params![proxy, name],
+            |row| row.get(0),
+        )
     }
 
     /// 业务作用：短期记住全部镜像的 404，限制重复错误名称造成的回源放大。
@@ -330,11 +359,20 @@ impl Store {
     pub fn save_proxy_missing(&self, proxy: &str, name: &str) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM proxy_missing WHERE rowid IN (SELECT rowid FROM proxy_missing WHERE expires_at <= unixepoch() LIMIT 256)", [])?;
-        let count: u64 =
-            transaction.query_row("SELECT count(*) FROM proxy_missing", [], |row| row.get(0))?;
+        transaction.execute(
+            crate::statements::Statement::ProxyResolutionSaveProxyMissingDeleteProxyMissing,
+            crate::database::params![],
+        )?;
+        let count: u64 = transaction.query_row(
+            crate::statements::Statement::ProxyResolutionSaveProxyMissingQueryProxyMissing,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         if count < 8192 {
-            transaction.execute("INSERT INTO proxy_missing(proxy_id, name, expires_at) SELECT id, ?2, unixepoch() + 30 FROM proxy_repositories WHERE name = ?1 ON CONFLICT(proxy_id, name) DO UPDATE SET expires_at = excluded.expires_at", params![proxy, name])?;
+            transaction.execute(
+                crate::statements::Statement::ProxyResolutionSaveProxyMissingInsertProxyMissing,
+                params![proxy, name],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -381,14 +419,18 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("object lifecycle unavailable"))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM proxy_sessions WHERE id = ?1 AND actor = ?2 AND expires_at > unixepoch())", params![session.id, actor], |row| row.get(0))?;
+        let active: bool = transaction.query_row(
+            crate::statements::Statement::ProxyResolutionCommitMaterializationQueryProxySessions,
+            params![session.id, actor],
+            |row| row.get(0),
+        )?;
         ensure!(
             active,
             crate::RepositoryFailure::NotFound("unknown proxy session")
         );
         for item in &items {
             let body: Vec<u8> = transaction.query_row(
-                "SELECT body FROM proxy_session_entries WHERE session_id = ?1 AND name = ?2",
+                crate::statements::Statement::ProxyResolutionCommitMaterializationQueryProxySessionEntries,
                 params![session.id, item.name],
                 |row| row.get(0),
             )?;
@@ -404,7 +446,7 @@ impl Store {
                         && entry.cksum == item.digest
                 });
             let stored: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM proxy_objects WHERE proxy_id = ?1 AND digest = ?2)",
+                crate::statements::Statement::ProxyResolutionCommitMaterializationQueryProxyObjects,
                 params![session.proxy_id, item.digest.as_str()],
                 |row| row.get(0),
             )?;
@@ -414,11 +456,11 @@ impl Store {
                 "public object is not completely materialized"
             );
         }
-        let existing: Option<String> = transaction.query_row("SELECT id FROM proxy_materializations WHERE proxy_id = ?1 AND actor = ?2 AND fingerprint = ?3 AND valid = 1", params![session.proxy_id, actor, fingerprint.as_str()], |row| row.get(0)).optional()?;
+        let existing: Option<String> = transaction.query_row(crate::statements::Statement::ProxyResolutionCommitMaterializationQueryProxyMaterializations, params![session.proxy_id, actor, fingerprint.as_str()], |row| row.get(0)).optional()?;
         let id = existing.unwrap_or_else(|| Uuid::new_v4().to_string());
-        transaction.execute("INSERT OR IGNORE INTO proxy_materializations(id, proxy_id, actor, fingerprint) VALUES (?1, ?2, ?3, ?4)", params![id, session.proxy_id, actor, fingerprint.as_str()])?;
+        transaction.execute(crate::statements::Statement::ProxyResolutionCommitMaterializationInsertProxyMaterializations, params![id, session.proxy_id, actor, fingerprint.as_str()])?;
         for item in items {
-            transaction.execute("INSERT OR IGNORE INTO materialization_items(materialization_id, name, version, digest) VALUES (?1, ?2, ?3, ?4)", params![id, item.name, item.version, item.digest.as_str()])?;
+            transaction.execute(crate::statements::Statement::ProxyResolutionCommitMaterializationInsertMaterializationItems, params![id, item.name, item.version, item.digest.as_str()])?;
         }
         transaction.commit()?;
         Ok(Materialization {

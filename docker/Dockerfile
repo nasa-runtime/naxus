@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1.97-alpine3.24@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS builder
 ARG TARGETARCH
 WORKDIR /build
@@ -31,6 +32,7 @@ ARG NAXUS_REVISION=local
 LABEL org.opencontainers.image.title="Naxus" \
       org.opencontainers.image.description="Rust artifact repository with same-version publishing, immutable snapshots and public registry caching" \
       org.opencontainers.image.source="https://github.com/nasa-runtime/naxus" \
+      org.opencontainers.image.url="https://hub.docker.com/r/nasaruntime/naxus" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${NAXUS_VERSION}" \
       org.opencontainers.image.revision="${NAXUS_REVISION}"
@@ -43,8 +45,7 @@ ENV PATH=/usr/local/bin:/bin \
     NAXUS_DATA_PATH=/var/lib/naxus \
     NAXUS_LOG_PATH=/usr/local/logs/naxus \
     NAXUS_ACCESS_MODE=managed \
-    NAXUS_PORT=7443 \
-    TZ=Etc/UTC
+    NAXUS_PORT=7443
 WORKDIR /opt/naxus
 USER 10001:10001
 EXPOSE 7443

@@ -21,7 +21,7 @@ Admin 的 `/admin/api/v1/login` 建立浏览器会话。认证后的写操作需
 | `/proxies/{proxy}/index/` | 独立公开来源的持久 sparse 缓存 |
 | `/proxies/{proxy}/sessions` | 固定公开解析视图及物化集合 |
 | `/api/naxus/v1` | 仓库能力、身份、解析、发布批次及保留租约 |
-| `/livez`、`/readyz`、`/metrics` | NASA 进程状态、读取就绪和有限基数指标 |
+| `/healthz`、`/readyz`、`/metrics` | NASA 进程状态、读取就绪和有限基数指标；`/metrics` 需要显式启用[观测出口](configuration.md#观测出口) |
 
 sparse 请求先读取 `config.json`，再按标准 crate 名称路径读取 JSONL；包体使用响应中提供的下载模板。调用方保留原始包体字节并核对索引 checksum，不自行拼接其他来源的地址。
 

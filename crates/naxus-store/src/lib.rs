@@ -30,6 +30,10 @@ pub use proxy::{ProxyIndex, ProxyInfo};
 pub use proxy_resolution::{
     Materialization, MaterializationItem, ProxySession, UpstreamValidation,
 };
-pub use repository::{CommitRequest, RepositoryInfo, Store, StoreOptions};
+pub use repository::{CommitRequest, PreparedStore, RepositoryInfo, Store, StoreOptions};
 pub use retention::RetentionPin;
 pub use security::{AccessIdentity, LoginUser, TokenGrant, UserInfo};
+
+mod database;
+mod schema;
+mod statements;

@@ -12,7 +12,8 @@ done
 cp /etc/ssl/certs/ca-certificates.crt /rootfs/etc/ssl/certs/
 ln -s certs/ca-certificates.crt /rootfs/etc/ssl/cert.pem
 cp -a /usr/share/zoneinfo /rootfs/usr/share/
-ln -s /usr/share/zoneinfo/Etc/UTC /rootfs/etc/localtime
+# 独立时区文件允许宿主只读挂载，不会跟随符号链接改写共享的 zoneinfo 定义。
+cp /usr/share/zoneinfo/Etc/UTC /rootfs/etc/localtime
 printf 'root:x:0:0:root:/root:/bin/sh\nnaxus:x:10001:10001:Naxus:/var/lib/naxus:/bin/sh\n' > /rootfs/etc/passwd
 printf 'root:x:0:\nnaxus:x:10001:\n' > /rootfs/etc/group
 chmod 1777 /rootfs/tmp

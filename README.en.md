@@ -21,9 +21,24 @@ Business workspace -> Cargo client + credential provider -> Naxus single listene
                                                            SQLite metadata + original artifacts
 ```
 
-Publication validates and synchronizes artifact files before atomically committing revisions, snapshots, idempotency records and HEAD. Consumers bind source identities and a snapshot, obtain a retention lease, run native Cargo, and commit Cargo.lock/naxus.lock through a durable journal. Same-version refresh and historical access do not depend on deleting Cargo caches.
+NASA Application manages the SQLite datasource through its `db` component. SQL is declared on Mapper traits and executed through SQL macros. Publication validates and synchronizes artifact files before atomically committing revisions, snapshots, idempotency records and HEAD. Consumers bind source identities and a snapshot, obtain a retention lease, run native Cargo, and commit Cargo.lock/naxus.lock through a durable journal. Same-version refresh and historical access do not depend on deleting Cargo caches.
 
 Each proxy retains one logical registry identity. Verified archives are persisted after the first fetch; mirrors are tried in order and independent registries are kept separate. One writer owns a data root. The server never runs uploaded code. See [architecture](docs/architecture.md) for persistence order and boundaries.
+
+## Docker quick start
+
+On a Linux host, keep data and file logs in separate persistent volumes and mount the host timezone read-only:
+
+```sh
+docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
+  -p 127.0.0.1:7443:7443 \
+  -v naxus-data:/var/lib/naxus \
+  -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/naxus:1.0.0
+```
+
+Open `http://127.0.0.1:7443/admin/`, log in as `admin`, and read the initial password with `docker exec naxus cat /var/lib/naxus/bootstrap/admin.password`. Change it on first login. Both named volumes retain their contents across container replacement. The image includes its default YAML. Complete commands for custom configuration, Docker Desktop, ports, timezone, reverse proxies and recovery are in the [Docker Hub guide](docker/README.md).
 
 ## Build and start
 
@@ -31,9 +46,9 @@ Rust/Cargo **1.97 or newer** is required. Server and client currently support lo
 
 ```sh
 cargo build --workspace --release --locked
-cargo install --path . --locked
-cargo install --path crates/cargo-naxus --locked
-cargo install --path crates/cargo-credential-naxus --locked
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/naxus target/release/cargo-naxus target/release/cargo-credential-naxus "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/state/naxus/logs"
 export NAXUS_LOG_PATH="$HOME/.local/state/naxus/logs"
 naxus serve --config zcf/application.yml
@@ -44,6 +59,8 @@ Keep the two client executables together on PATH. Defaults: `127.0.0.1:7443`, da
 Open `http://127.0.0.1:7443/admin/`. The first administrator password is generated into `<data-root>/bootstrap/admin.password` with restricted permissions. First login requires a password change. Restarting preserves accounts. Create separate read/publish tokens for developers and CI.
 
 Logging uses `${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}`; local users should set `NAXUS_LOG_PATH` to a writable directory. See [operations](docs/operations.md), [configuration](docs/configuration.md), and [Docker](docker/README.md).
+
+Configuration selection follows `serve --config <path>` → non-empty `APP_CONFIG_FILE` → `zcf/application.yml`. Relative main paths are resolved against the process working directory. An unreadable or invalid selected file prevents startup.
 
 The [first-use guide](docs/quickstart.md) walks through login, tokens, a producer and a consumer. Companion clients run on developer machines or CI; the server image does not contain Cargo or a Rust toolchain.
 
@@ -110,11 +127,15 @@ One active writer owns a data root. The root must be owned by the service accoun
 
 Docker defaults to UID/GID `10001:10001`, `/var/lib/naxus` data, `/usr/local/logs/naxus` logs and managed authentication. Use local ext4/XFS/Btrfs/F2FS/overlayfs or APFS/HFS+. Docker Desktop requires Linux native named volumes rather than host-shared data mounts.
 
-Defaults are 256 MiB per artifact and a 2 GiB free-space reserve. Low space rejects new writes while existing complete objects remain readable. Upstream outages do not revoke cached graphs. Failed explicit refresh leaves both workspace locks untouched. NASA owns the single listener, signals, `/livez`, `/readyz` and `/metrics`.
+Defaults are 256 MiB per artifact and a 2 GiB free-space reserve. Low space rejects new writes while existing complete objects remain readable. Upstream outages do not revoke cached graphs. Failed explicit refresh leaves both workspace locks untouched. NASA owns the single listener and signals, and serves `/healthz` and `/readyz`. Enable the observability exporter explicitly to expose `/metrics` on the same port; see [configuration](docs/configuration.md#观测出口).
 
-Objects that never acquired a hosted or public reference may be collected after a one-hour grace period, while active batches, sessions and readers remain protected. Published historical artifacts are excluded from this automatic cleanup. Managed builds reject Git dependencies, `[patch]`, `[replace]` and Cargo configuration includes before network resolution. Path dependencies must belong to the same workspace.
+Objects that never acquired a hosted or public reference may be collected after a one-hour grace period, while active batches, sessions and readers remain protected. Published historical artifacts are excluded from this automatic cleanup. Managed builds reject Git dependencies, `[patch]`, `[replace]` and Cargo configuration includes before network resolution. Local package dependencies must belong to the same workspace.
 
 No multi-writer HA, zero-downtime upgrades, enterprise SSO, public signup, Cargo owner/search APIs or server execution of uploaded code is provided. Build scripts and procedural macros run on consumers; authenticated publication does not establish code trust.
+
+## SQLite configuration
+
+Custom server YAML must configure `datasources.naxus` with driver `sqlite`, the database file `<naxus.data.root>/naxus.sqlite3`, one connection, WAL, FULL synchronization and foreign keys. NASA Application opens the datasource after the repository instance lock is acquired, and initialization completes schema upgrades and integrity checks before serving requests. Unknown schema progress, inconsistent references or an unsafe data directory prevent startup. See [configuration](docs/configuration.md) and [backup and recovery](docs/operations.md).
 
 ## Documentation
 

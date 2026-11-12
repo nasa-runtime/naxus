@@ -1,6 +1,6 @@
+use crate::database::{params, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Context, Result};
 use naxus_core::ArtifactDigest;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -56,7 +56,8 @@ impl Store {
     pub fn tokens(&self, actor: &AccessIdentity) -> Result<Vec<serde_json::Value>> {
         let connection = self.connection()?;
         browser_actor(&connection, actor)?;
-        let mut statement = connection.prepare("SELECT id, user_id, label, permission, repositories, expires_at, revoked, allow_overwrite, publish_crates FROM access_tokens WHERE user_id = ?1 OR ?2 = 'admin' ORDER BY expires_at DESC LIMIT 4096")?;
+        let mut statement =
+            connection.prepare(crate::statements::Statement::SecurityTokensQueryAccessTokens)?;
         let rows = statement
             .query_map(params![actor.subject, actor.role], |row| {
                 Ok((
@@ -71,7 +72,7 @@ impl Store {
                     row.get::<_, String>(8)?,
                 ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         rows.into_iter()
             .map(
                 |(
@@ -112,7 +113,8 @@ impl Store {
             crate::RepositoryFailure::InvalidRequest("invalid audit cursor")
         );
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT sequence, actor, action, target, created_at FROM security_audit WHERE sequence > ?1 ORDER BY sequence LIMIT 200")?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::SecuritySecurityAuditQuerySecurityAudit)?;
         let rows = statement
             .query_map([after], |row| {
                 Ok(serde_json::json!({
@@ -123,7 +125,7 @@ impl Store {
                     "created_at": row.get::<_, i64>(4)?
                 }))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -138,7 +140,8 @@ impl Store {
             crate::RepositoryFailure::InvalidRequest("invalid audit cursor")
         );
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT sequence, actor, action, target, created_at FROM security_audit WHERE ?1 = 0 OR sequence < ?1 ORDER BY sequence DESC LIMIT 200")?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::SecuritySecurityAuditPageQuerySecurityAudit)?;
         let rows = statement
             .query_map([before], |row| {
                 Ok(serde_json::json!({
@@ -149,7 +152,7 @@ impl Store {
                     "created_at": row.get::<_, i64>(4)?
                 }))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -179,18 +182,26 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let allowed: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = ?1 AND role = 'admin' AND enabled = 1 AND must_change = 0)", [actor], |row| row.get(0))?;
+        let allowed: bool = transaction.query_row(
+            crate::statements::Statement::SecuritySetUserGrantsQueryAdminUsers,
+            [actor],
+            |row| row.get(0),
+        )?;
         ensure!(
             allowed,
             crate::RepositoryFailure::Forbidden("administrator permission required")
         );
         let (old_role, enabled): (String, bool) = transaction.query_row(
-            "SELECT role, enabled FROM admin_users WHERE id = ?1",
+            crate::statements::Statement::SecuritySetUserGrantsQueryAdminUsers2,
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if old_role == "admin" && enabled && role != "admin" {
-            let remaining: u64 = transaction.query_row("SELECT count(*) FROM admin_users WHERE role = 'admin' AND enabled = 1 AND id != ?1", [id], |row| row.get(0))?;
+            let remaining: u64 = transaction.query_row(
+                crate::statements::Statement::SecuritySetUserGrantsQueryAdminUsers3,
+                [id],
+                |row| row.get(0),
+            )?;
             // 角色修改不能消灭全部管理入口，重启不补建账号或放宽权限。
             ensure!(
                 remaining > 0,
@@ -199,8 +210,14 @@ impl Store {
                 )
             );
         }
-        transaction.execute("UPDATE admin_users SET role = ?1, repositories = ?2, auth_version = auth_version + 1 WHERE id = ?3", params![role, serde_json::to_string(repositories)?, id])?;
-        transaction.execute("INSERT INTO security_audit(actor, action, target) VALUES (?1, 'change-user-grants', ?2)", params![actor, id])?;
+        transaction.execute(
+            crate::statements::Statement::SecuritySetUserGrantsUpdateAdminUsers,
+            params![role, serde_json::to_string(repositories)?, id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::SecuritySetUserGrantsInsertSecurityAudit,
+            params![actor, id],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -221,15 +238,23 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let allowed: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = ?1 AND role = 'admin' AND enabled = 1 AND must_change = 0)", [actor], |row| row.get(0))?;
+        let allowed: bool = transaction.query_row(
+            crate::statements::Statement::SecuritySetUserEnabledQueryAdminUsers,
+            [actor],
+            |row| row.get(0),
+        )?;
         ensure!(
             allowed,
             crate::RepositoryFailure::Forbidden("administrator permission required")
         );
         if !enabled {
-            let remaining: u64 = transaction.query_row("SELECT count(*) FROM admin_users WHERE role = 'admin' AND enabled = 1 AND id != ?1", [id], |row| row.get(0))?;
+            let remaining: u64 = transaction.query_row(
+                crate::statements::Statement::SecuritySetUserEnabledQueryAdminUsers2,
+                [id],
+                |row| row.get(0),
+            )?;
             let admin: bool = transaction.query_row(
-                "SELECT role = 'admin' FROM admin_users WHERE id = ?1",
+                crate::statements::Statement::SecuritySetUserEnabledQueryAdminUsers3,
                 [id],
                 |row| row.get(0),
             )?;
@@ -241,9 +266,15 @@ impl Store {
                 )
             );
         }
-        ensure!(transaction.execute("UPDATE admin_users SET enabled = ?1, auth_version = auth_version + 1 WHERE id = ?2", params![enabled, id])? == 1, crate::RepositoryFailure::NotFound("unknown user"));
+        ensure!(
+            transaction.execute(
+                crate::statements::Statement::SecuritySetUserEnabledUpdateAdminUsers,
+                params![enabled, id]
+            )? == 1,
+            crate::RepositoryFailure::NotFound("unknown user")
+        );
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, ?2, ?3)",
+            crate::statements::Statement::SecuritySetUserEnabledInsertSecurityAudit,
             params![
                 actor,
                 if enabled {
@@ -262,11 +293,11 @@ impl Store {
     ///
     /// 返回：已有用户和仍需更换初始口令的用户数量。
     pub fn bootstrap_status(&self) -> Result<(u64, u64)> {
-        Ok(self.connection()?.query_row(
-            "SELECT count(*), coalesce(sum(must_change), 0) FROM admin_users",
-            [],
+        self.connection()?.query_row(
+            crate::statements::Statement::SecurityBootstrapStatusQueryAdminUsers,
+            crate::database::params![],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )?)
+        )
     }
 
     /// 业务作用：在空数据卷建立唯一初始管理员，首次登录只能设置新口令。
@@ -277,12 +308,21 @@ impl Store {
     pub fn bootstrap_admin(&self, password_hash: &str) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let count: u64 =
-            transaction.query_row("SELECT count(*) FROM admin_users", [], |row| row.get(0))?;
+        let count: u64 = transaction.query_row(
+            crate::statements::Statement::SecurityBootstrapAdminQueryAdminUsers,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         if count == 0 {
             let id = Uuid::new_v4().to_string();
-            transaction.execute("INSERT INTO admin_users(id, username, password_hash, role, repositories, must_change) VALUES (?1, 'admin', ?2, 'admin', ?3, 1)", params![id, password_hash, serde_json::to_string(&["*"])?])?;
-            transaction.execute("INSERT INTO security_audit(actor, action, target) VALUES ('bootstrap', 'create_administrator', ?1)", [&id])?;
+            transaction.execute(
+                crate::statements::Statement::SecurityBootstrapAdminInsertAdminUsers,
+                params![id, password_hash, serde_json::to_string(&["*"])?],
+            )?;
+            transaction.execute(
+                crate::statements::Statement::SecurityBootstrapAdminInsertSecurityAudit,
+                [&id],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -295,10 +335,9 @@ impl Store {
     /// 返回：存在用户的受限校验材料；不存在为 None。
     pub fn login_user(&self, username: &str) -> Result<Option<LoginUser>> {
         let connection = self.connection()?;
-        Ok(connection
+        connection
             .query_row(
-                "SELECT id, password_hash, auth_version, enabled = 1 AND not_before <= unixepoch()
-             FROM admin_users WHERE username = ?1",
+                crate::statements::Statement::SecurityLoginUserQueryAdminUsers,
                 [username],
                 |row| {
                     Ok(LoginUser {
@@ -309,7 +348,7 @@ impl Store {
                     })
                 },
             )
-            .optional()?)
+            .optional()
     }
 
     /// 业务作用：在口令校验后复验账户代次并创建会话，防止并发禁用或换密后沿用旧验证。
@@ -329,12 +368,19 @@ impl Store {
     ) -> Result<bool> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM admin_sessions WHERE digest IN (SELECT digest FROM admin_sessions WHERE expires_at <= unixepoch() LIMIT 256)", [])?;
-        let current: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = ?1 AND auth_version = ?2 AND enabled = 1 AND not_before <= unixepoch())", params![user.id, user.auth_version], |row| row.get(0))?;
+        transaction.execute(
+            crate::statements::Statement::SecurityFinishLoginDeleteAdminSessions,
+            crate::database::params![],
+        )?;
+        let current: bool = transaction.query_row(
+            crate::statements::Statement::SecurityFinishLoginQueryAdminUsers,
+            params![user.id, user.auth_version],
+            |row| row.get(0),
+        )?;
         let accepted = accepted && current;
         if accepted {
             let (total, owned): (u64, u64) = transaction.query_row(
-                "SELECT count(*), coalesce(sum(user_id = ?1), 0) FROM admin_sessions",
+                crate::statements::Statement::SecurityFinishLoginQueryAdminSessions,
                 [&user.id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -343,15 +389,21 @@ impl Store {
                 crate::ResourceLimitExceeded("session budget exceeded")
             );
             transaction.execute(
-                "UPDATE admin_users SET failures = 0, not_before = 0 WHERE id = ?1",
+                crate::statements::Statement::SecurityFinishLoginUpdateAdminUsers,
                 [&user.id],
             )?;
-            transaction.execute("INSERT INTO admin_sessions(digest, user_id, csrf_digest, auth_version, expires_at) VALUES (?1, ?2, ?3, ?4, unixepoch() + 28800)", params![session.as_str(), user.id, csrf.as_str(), user.auth_version])?;
+            transaction.execute(
+                crate::statements::Statement::SecurityFinishLoginInsertAdminSessions,
+                params![session.as_str(), user.id, csrf.as_str(), user.auth_version],
+            )?;
         } else {
-            transaction.execute("UPDATE admin_users SET failures = min(failures + 1, 15), not_before = CASE WHEN failures >= 4 THEN unixepoch() + min(900, (1 << min(failures - 3, 10))) ELSE not_before END WHERE id = ?1 AND auth_version = ?2", params![user.id, user.auth_version])?;
+            transaction.execute(
+                crate::statements::Statement::SecurityFinishLoginUpdateAdminUsers2,
+                params![user.id, user.auth_version],
+            )?;
         }
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, ?2, ?1)",
+            crate::statements::Statement::SecurityFinishLoginInsertSecurityAudit,
             params![
                 user.id,
                 if accepted {
@@ -376,7 +428,23 @@ impl Store {
         session: &ArtifactDigest,
         csrf: Option<&ArtifactDigest>,
     ) -> Result<Option<AccessIdentity>> {
-        let raw: Option<(String, String, String, String, bool, u64)> = self.connection()?.query_row("SELECT u.id, u.username, u.role, u.repositories, u.must_change, u.auth_version FROM admin_sessions s JOIN admin_users u ON u.id = s.user_id WHERE s.digest = ?1 AND s.expires_at > unixepoch() AND s.auth_version = u.auth_version AND u.enabled = 1 AND (?2 IS NULL OR s.csrf_digest = ?2)", params![session.as_str(), csrf.map(ArtifactDigest::as_str)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))).optional()?;
+        let raw: Option<(String, String, String, String, bool, u64)> = self
+            .connection()?
+            .query_row(
+                crate::statements::Statement::SecurityBrowserIdentityQueryAdminSessions,
+                params![session.as_str(), csrf.map(ArtifactDigest::as_str)],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
         raw.map(
             |(subject, username, role, repositories, must_change, auth_version)| {
                 Ok(AccessIdentity {
@@ -400,7 +468,7 @@ impl Store {
     /// 返回：会话不再可用；重复注销保持幂等。
     pub fn logout(&self, session: &ArtifactDigest) -> Result<()> {
         self.connection()?.execute(
-            "DELETE FROM admin_sessions WHERE digest = ?1",
+            crate::statements::Statement::SecurityLogoutDeleteAdminSessions,
             [session.as_str()],
         )?;
         Ok(())
@@ -412,9 +480,10 @@ impl Store {
     /// 返回：有界且按用户名排序的账户描述。
     pub fn users(&self) -> Result<Vec<UserInfo>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT id, username, role, repositories, enabled, must_change FROM admin_users ORDER BY username LIMIT 4096")?;
+        let mut statement =
+            connection.prepare(crate::statements::Statement::SecurityUsersQueryAdminUsers)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(crate::database::params![], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -424,7 +493,7 @@ impl Store {
                     row.get::<_, bool>(5)?,
                 ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         rows.into_iter()
             .map(|(id, username, role, repositories, enabled, must_change)| {
                 Ok(UserInfo {
@@ -472,13 +541,17 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let actor = crate::security::browser_actor(&transaction, actor)?;
-        let admin: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM admin_users WHERE id = ?1 AND role = 'admin' AND enabled = 1 AND must_change = 0)", [actor], |row| row.get(0))?;
+        let admin: bool = transaction.query_row(
+            crate::statements::Statement::SecurityCreateUserQueryAdminUsers,
+            [actor],
+            |row| row.get(0),
+        )?;
         ensure!(
             admin,
             crate::RepositoryFailure::Forbidden("administrator permission required")
         );
         let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM admin_users WHERE username = ?1)",
+            crate::statements::Statement::SecurityCreateUserQueryAdminUsers2,
             [username],
             |row| row.get(0),
         )?;
@@ -487,16 +560,28 @@ impl Store {
             !exists,
             crate::RepositoryFailure::Conflict("username already exists".to_owned())
         );
-        let count: u64 =
-            transaction.query_row("SELECT count(*) FROM admin_users", [], |row| row.get(0))?;
+        let count: u64 = transaction.query_row(
+            crate::statements::Statement::SecurityCreateUserQueryAdminUsers3,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         ensure!(
             count < 4096,
             crate::ResourceLimitExceeded("user budget exceeded")
         );
         let id = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO admin_users(id, username, password_hash, role, repositories) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, username, hash, role, serde_json::to_string(repositories)?])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'create_user', ?2)",
+            crate::statements::Statement::SecurityCreateUserInsertAdminUsers,
+            params![
+                id,
+                username,
+                hash,
+                role,
+                serde_json::to_string(repositories)?
+            ],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::SecurityCreateUserInsertSecurityAudit,
             params![actor, id],
         )?;
         transaction.commit()?;
@@ -512,14 +597,20 @@ impl Store {
     pub fn change_password(&self, user: &LoginUser, hash: &str) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute("UPDATE admin_users SET password_hash = ?1, must_change = 0, auth_version = auth_version + 1, failures = 0, not_before = 0 WHERE id = ?2 AND auth_version = ?3 AND enabled = 1", params![hash, user.id, user.auth_version])?;
+        let changed = transaction.execute(
+            crate::statements::Statement::SecurityChangePasswordUpdateAdminUsers,
+            params![hash, user.id, user.auth_version],
+        )?;
         ensure!(
             changed == 1,
             crate::RepositoryFailure::Conflict("account authentication changed".to_owned())
         );
-        transaction.execute("DELETE FROM admin_sessions WHERE user_id = ?1", [&user.id])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'change_password', ?1)",
+            crate::statements::Statement::SecurityChangePasswordDeleteAdminSessions,
+            [&user.id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::SecurityChangePasswordInsertSecurityAudit,
             [&user.id],
         )?;
         transaction.commit()?;
@@ -629,15 +720,33 @@ impl Store {
         // 换密或授权变化后的旧请求不能借用新代次签发永久凭据，必须复验入站身份的同一代次。
         browser_actor(&transaction, actor)?;
         let version = actor.auth_version;
-        let count: u64 = transaction.query_row("SELECT count(*) FROM access_tokens WHERE user_id = ?1 AND revoked = 0 AND expires_at > unixepoch()", [&actor.subject], |row| row.get(0))?;
+        let count: u64 = transaction.query_row(
+            crate::statements::Statement::SecurityCreateScopedTokenQueryAccessTokens,
+            [&actor.subject],
+            |row| row.get(0),
+        )?;
         ensure!(
             count < 128,
             crate::ResourceLimitExceeded("token budget exceeded")
         );
         let id = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO access_tokens(id, digest, user_id, label, permission, repositories, auth_version, expires_at, allow_overwrite, publish_crates) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch() + ?8, ?9, ?10)", params![id, digest.as_str(), actor.subject, label, permission, serde_json::to_string(repositories)?, version, ttl_seconds, allow_overwrite, serde_json::to_string(publish_crates)?])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'create_token', ?2)",
+            crate::statements::Statement::SecurityCreateScopedTokenInsertAccessTokens,
+            params![
+                id,
+                digest.as_str(),
+                actor.subject,
+                label,
+                permission,
+                serde_json::to_string(repositories)?,
+                version,
+                ttl_seconds,
+                allow_overwrite,
+                serde_json::to_string(publish_crates)?
+            ],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::SecurityCreateScopedTokenInsertSecurityAudit,
             params![actor.subject, id],
         )?;
         transaction.commit()?;
@@ -666,7 +775,7 @@ impl Store {
         browser_actor(&transaction, actor)?;
         let owner: String = transaction
             .query_row(
-                "SELECT user_id FROM access_tokens WHERE id = ?1",
+                crate::statements::Statement::SecurityRevokeTokenQueryAccessTokens,
                 [id],
                 |row| row.get(0),
             )
@@ -676,9 +785,12 @@ impl Store {
             owner == actor.subject || actor.role == "admin",
             crate::RepositoryFailure::Forbidden("token ownership permission denied")
         );
-        transaction.execute("UPDATE access_tokens SET revoked = 1 WHERE id = ?1", [id])?;
         transaction.execute(
-            "INSERT INTO security_audit(actor, action, target) VALUES (?1, 'revoke_token', ?2)",
+            crate::statements::Statement::SecurityRevokeTokenUpdateAccessTokens,
+            [id],
+        )?;
+        transaction.execute(
+            crate::statements::Statement::SecurityRevokeTokenInsertSecurityAudit,
             params![actor.subject, id],
         )?;
         transaction.commit()?;
@@ -693,14 +805,16 @@ impl Store {
 ///
 /// 返回：同代次、启用且授权一致时提供审计主体 UUID；账号变化或尚未换密时拒绝后续副作用。
 pub(crate) fn browser_actor<'a>(
-    connection: &rusqlite::Connection,
+    connection: &crate::database::Connection,
     actor: &'a AccessIdentity,
 ) -> Result<&'a str> {
-    let current: Option<(String, String)> = connection.query_row(
-        "SELECT role, repositories FROM admin_users WHERE id = ?1 AND auth_version = ?2 AND enabled = 1 AND must_change = 0",
-        params![actor.subject, actor.auth_version],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional()?;
+    let current: Option<(String, String)> = connection
+        .query_row(
+            crate::statements::Statement::SecurityBrowserActorQueryAdminUsers,
+            params![actor.subject, actor.auth_version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
     // 入站认证之后仍可能等待队列或口令计算；提交事务不能借用账号的新代次来完成旧请求。
     let (role, repositories) = current.context(crate::RepositoryFailure::Forbidden(
         "browser identity permission revoked",
@@ -722,10 +836,26 @@ pub(crate) fn browser_actor<'a>(
 ///
 /// 返回：当前有效身份和收窄后的仓库范围，失效时为 None。
 pub(crate) fn token_identity_on(
-    connection: &rusqlite::Connection,
+    connection: &crate::database::Connection,
     digest: &ArtifactDigest,
 ) -> Result<Option<AccessIdentity>> {
-    let raw: Option<(String, String, String, String, String, bool, u64)> = connection.query_row("SELECT u.id, u.username, u.role, u.repositories, t.repositories, t.permission = 'publish', u.auth_version FROM access_tokens t JOIN admin_users u ON u.id = t.user_id WHERE t.digest = ?1 AND t.revoked = 0 AND t.expires_at > unixepoch() AND t.auth_version = u.auth_version AND u.enabled = 1 AND u.must_change = 0", [digest.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))).optional()?;
+    let raw: Option<(String, String, String, String, String, bool, u64)> = connection
+        .query_row(
+            crate::statements::Statement::SecurityTokenIdentityOnQueryAccessTokens,
+            [digest.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
     raw.map(
         |(subject, username, role, granted, scopes, publish, auth_version)| {
             let granted: Vec<String> = serde_json::from_str(&granted)?;

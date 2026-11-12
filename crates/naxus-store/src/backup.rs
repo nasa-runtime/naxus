@@ -2,12 +2,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::{ensure, Context, Result};
 use naxus_core::ArtifactDigest;
-use rusqlite::{backup::Backup, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -39,14 +37,13 @@ impl Store {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("object lifecycle unavailable"))?;
             let connection = self.connection()?;
-            let mut statement = connection.prepare(
-                "SELECT sha256, size FROM objects WHERE state = 'present' ORDER BY sha256",
-            )?;
+            let mut statement =
+                connection.prepare(crate::statements::Statement::BackupBackupQueryObjects)?;
             let objects = statement
-                .query_map([], |row| {
+                .query_map(crate::database::params![], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
                 })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+                .collect::<sqlx::Result<Vec<_>>>()?
                 .into_iter()
                 .map(|(sha256, size)| {
                     Ok(crate::StoredObject {
@@ -56,14 +53,8 @@ impl Store {
                 })
                 .collect::<Result<Vec<_>>>()?;
             let target_database = staging.join("naxus.sqlite3");
-            let mut target = Connection::open(&target_database)?;
-            // 数据库连接和对象生命周期同时保持独占，清单中的引用与复制的字节属于同一可恢复状态。
-            Backup::new(&connection, &mut target)?.run_to_completion(
-                128,
-                Duration::from_millis(1),
-                None,
-            )?;
-            target.close().map_err(|(_, error)| error)?;
+            // 元数据执行域与对象生命周期同时保持独占，清单与复制内容属于同一可恢复状态。
+            connection.backup_to(&target_database)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -140,10 +131,13 @@ impl Store {
         Uuid::parse_str(&manifest.service_uuid)?;
         let (destination, staging) = prepare(destination, Some(&backup))?;
         let result = (|| {
-            copy_verified(
+            ensure!(
+                file_digest(&backup.join("naxus.sqlite3"))? == manifest.database_sha256,
+                "backup database checksum mismatch"
+            );
+            crate::database::restore_database(
                 &backup.join("naxus.sqlite3"),
                 &staging.join("naxus.sqlite3"),
-                &manifest.database_sha256,
             )?;
             fs::create_dir_all(staging.join("objects/sha256"))?;
             let mut unique = std::collections::BTreeSet::new();

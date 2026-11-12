@@ -34,19 +34,20 @@ cargo naxus update          让 Cargo 重新选择约束内的版本
                                               SQLite 元数据 + 原始制品文件
 ```
 
-发布先校验并同步制品文件，再在一个 SQLite 事务中提交修订、快照、幂等结果与 HEAD。消费者先固定快照和来源、取得保护租约，再交给原生 Cargo 解析和构建；`Cargo.lock` 与 `naxus.lock` 通过持久日志一起提交。这样同版本更新、历史读取和中断恢复使用明确身份，不依赖清空 Cargo 缓存。
+SQLite 由 NASA Application 的 `db` 组件统一管理，业务 SQL 通过 Mapper trait 和 SQL 宏执行。发布先校验并同步制品文件，再在一个 SQLite 事务中提交修订、快照、幂等结果与 HEAD。消费者先固定快照和来源、取得保护租约，再交给原生 Cargo 解析和构建；`Cargo.lock` 与 `naxus.lock` 通过持久日志一起提交。这样同版本更新、历史读取和中断恢复使用明确身份，不依赖清空 Cargo 缓存。
 
 公开包体首次按需拉取并核对 checksum 后长期保存。一个 proxy 对应一个逻辑 registry，其物理镜像按配置顺序尝试；其他独立 registry 保持独立身份。同一个数据根只允许一个活动写入者，服务端不执行上传代码。完整顺序与边界见[架构说明](docs/architecture.md)。
 
 ## Docker 启动
 
-镜像支持 `linux/amd64` 和 `linux/arm64`。本机启动时，将仓库数据与文件日志保存在独立持久卷中：
+镜像支持 `linux/amd64` 和 `linux/arm64`。Linux 宿主机使用独立数据卷、日志卷和只读时区挂载：
 
 ```sh
 docker run -d --name naxus --restart unless-stopped --stop-timeout 75 \
   -p 127.0.0.1:7443:7443 \
   -v naxus-data:/var/lib/naxus \
   -v naxus-logs:/usr/local/logs/naxus \
+  -v /etc/localtime:/etc/localtime:ro \
   nasaruntime/naxus:1.0.0
 ```
 
@@ -58,7 +59,7 @@ docker exec naxus cat /var/lib/naxus/bootstrap/admin.password
 
 首次登录后必须修改口令；复用数据卷不会重置账号。`naxus-data` 保存完整仓库数据，`naxus-logs` 保存文件日志。
 
-镜像内置 `application.yml`，无需挂载 YAML 即可启动。自定义配置时，将包含 `application.yml` 的目录只读挂载到 `/opt/naxus/zcf`，修改后重启服务。配置挂载、环境变量和远程 HTTPS 部署见[容器说明](docker/README.md)。
+镜像内置 `application.yml`，默认启动无需额外配置。自定义 YAML、`APP_CONFIG_FILE`、端口、时区、Docker Desktop、反向代理和备份恢复的完整命令见 [Docker Hub 使用说明](docker/README.md)。
 
 ## 从源码构建和启动
 
@@ -66,9 +67,9 @@ docker exec naxus cat /var/lib/naxus/bootstrap/admin.password
 
 ```sh
 cargo build --workspace --release --locked
-cargo install --path . --locked
-cargo install --path crates/cargo-naxus --locked
-cargo install --path crates/cargo-credential-naxus --locked
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/naxus target/release/cargo-naxus target/release/cargo-credential-naxus "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/state/naxus/logs"
 export NAXUS_LOG_PATH="$HOME/.local/state/naxus/logs"
 naxus serve --config zcf/application.yml
@@ -81,6 +82,10 @@ naxus serve --config zcf/application.yml
 Admin 地址为 `http://127.0.0.1:7443/admin/`。首次启动生成一次性管理员口令，保存在数据根的 `bootstrap/admin.password`，文件仅当前用户可读。登录后必须换密；重启不会重置账号。开发人员可在 Admin 创建自己的读取或发布 token。
 
 日志统一为 `${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}`。本机用户应将 `NAXUS_LOG_PATH` 设置为可写目录。配置、托管及备份见[运维说明](docs/operations.md)。
+
+主配置选择优先级为 `naxus serve --config <路径>` → 非空 `APP_CONFIG_FILE` → `zcf/application.yml`。选定文件不可读或校验失败时拒绝启动；主配置相对路径以进程工作目录解析。
+
+自定义 YAML 必须包含 `datasources.naxus`，使用 SQLite 单连接、WAL、FULL 同步与外键检查，数据库文件为数据根内的 `naxus.sqlite3`。启动先取得实例锁，再初始化数据库、升级结构并检查对象引用；未知结构或无法解释的数据缺失会阻止就绪。完整设置见[SQLite 数据源](docs/configuration.md#sqlite-数据源)。
 
 从第一次登录、创建 token 到生产者和消费者联调的完整步骤见[首次接入](docs/quickstart.md)。Docker 用户见[容器说明](docker/README.md)；客户端需要单独安装在开发机或 CI 中，服务镜像不包含 Cargo 工具链。
 
@@ -154,11 +159,11 @@ Admin 会话失效后清空旧身份与页面并返回登录；403 保留登录�
 
 服务独立常驻，客户端退出不会结束仓库。默认单节点单写入实例，SQLite WAL/FULL 与先对象后引用的顺序保证原子可见。启动恢复持久任务并核验受保护对象，无法解释的丢失或损坏拒绝就绪。详见[架构说明](docs/architecture.md)。
 
-数据根归运行账号所有，Unix 权限收紧为 0700，末级数据根不能是符号链接。受管构建的 path 依赖仅支持同一工作区成员；不接受 Git 依赖、`[patch]`、`[replace]`、Cargo 配置 include 或覆盖来源/锁文件的命令参数。
+数据根归运行账号所有，Unix 权限收紧为 0700，末级数据根不能是符号链接。受管构建只允许同一工作区的本地成员依赖；不接受 Git 依赖、`[patch]`、`[replace]`、Cargo 配置 include 或覆盖来源/锁文件的命令参数。
 
 Docker 默认 UID/GID `10001:10001`，数据 `/var/lib/naxus`，日志 `/usr/local/logs/naxus`，采用 managed 认证。启动、持久卷、反向代理、备份和升级见 [Docker 文档](docker/README.md)。Linux 支持 ext4/XFS/Btrfs/F2FS/overlayfs，macOS 支持 APFS/HFS+。Docker Desktop 使用 Linux 原生 named volume，宿主目录共享挂载不作为数据卷支持。
 
-默认单包上限 256 MiB、数据卷预留 2 GiB。低容量拒绝新增写入，已有完整包仍可读取。上游中断不撤销已保存依赖图的可读性；显式刷新无法取得新鲜证据时失败且不改写双锁。`/metrics`、`/livez`、`/readyz` 由 NASA 的唯一 Web listener 提供。
+默认单包上限 256 MiB、数据卷预留 2 GiB。低容量拒绝新增写入，已有完整包仍可读取。上游中断不撤销已保存依赖图的可读性；显式刷新无法取得新鲜证据时失败且不改写双锁。NASA 的唯一 Web listener 提供 `/healthz`、`/readyz`；显式启用观测出口后，同端口提供 `/metrics`，设置见[配置说明](docs/configuration.md#观测出口)。
 
 从未被业务修订或公开缓存引用的上传对象经过一小时宽限后可由后台回收，开放批次、活动解析和下载仍受保护；这项治理不自动淘汰已发布的历史制品。
 

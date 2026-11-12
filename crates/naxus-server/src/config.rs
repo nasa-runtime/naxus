@@ -317,50 +317,68 @@ impl Config {
     }
 }
 
-/// 业务作用：在框架 preflight 前固定显式配置文件与环境，保留标准 YAML 表达式和日志语义。
+/// 业务作用：在框架 preflight 前按显式参数、APP_CONFIG_FILE 和默认路径选择主配置，固定环境与 YAML 语义。
 /// 参数说明: 无。
 ///
 /// 返回：仓库命令对应的严格加载器；帮助或非法命令在创建运行时前结束。
 pub fn bootstrap_loader() -> nasa::yml::strict::Result<ConfigLoader> {
     static LOADER: OnceLock<nasa::yml::strict::Result<ConfigLoader>> = OnceLock::new();
-    LOADER.get_or_init(|| {
-        let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-        if arguments.first().is_some_and(|argument| matches!(argument.as_str(), "backup" | "restore")) {
-            match backup_command(&arguments) {
-                Ok(()) => std::process::exit(0),
-                Err(error) => {
-                    eprintln!("naxus: {error:#}");
-                    std::process::exit(1);
+    LOADER
+        .get_or_init(|| {
+            let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+            if arguments
+                .first()
+                .is_some_and(|argument| matches!(argument.as_str(), "backup" | "restore"))
+            {
+                match backup_command(&arguments) {
+                    Ok(()) => std::process::exit(0),
+                    Err(error) => {
+                        eprintln!("naxus: {error:#}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        if arguments.first().is_some_and(|argument| argument == "healthcheck") {
-            let code = if healthcheck(&arguments[1..]).is_ok() {
-                0
-            } else {
-                1
-            };
-            std::process::exit(code);
-        }
-        if arguments == ["--version"] {
-            println!("naxus {}", env!("CARGO_PKG_VERSION"));
-            std::process::exit(0);
-        }
-        if arguments == ["--help"] || arguments == ["-h"] {
-            println!("naxus serve [--config <application.yml>]\nnaxus healthcheck [--url <loopback-readyz-URL>]\nnaxus backup --data-dir <stopped-data-root> --output <new-directory>\nnaxus restore --backup <backup-directory> --data-dir <new-data-root>\n\nAdmin and Cargo registry share server.port.\nConfiguration defaults to zcf/application.yml.");
-            std::process::exit(0);
-        }
-        let loader = ConfigLoader::standard()?.profile(ProfileSelection::Disabled);
-        match arguments.as_slice() {
-            [] => Ok(loader),
-            [command] if command == "serve" => Ok(loader),
-            [command, flag, path] if command == "serve" && flag == "--config" => loader.base_file(path),
-            _ => {
-                eprintln!("usage: naxus serve [--config <application.yml>]");
-                std::process::exit(2);
+            if arguments
+                .first()
+                .is_some_and(|argument| argument == "healthcheck")
+            {
+                let code = if healthcheck(&arguments[1..]).is_ok() {
+                    0
+                } else {
+                    1
+                };
+                std::process::exit(code);
             }
-        }
-    }).clone()
+            if arguments == ["--version"] {
+                println!("naxus {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            if arguments == ["--help"] || arguments == ["-h"] {
+                println!(concat!(
+                    "naxus serve [--config <application.yml>]\n",
+                    "naxus healthcheck [--url <loopback-readyz-URL>]\n",
+                    "naxus backup --data-dir <stopped-data-root> --output <new-directory>\n",
+                    "naxus restore --backup <backup-directory> --data-dir <new-data-root>\n\n",
+                    "Admin and Cargo registry share server.port.\n",
+                    "Configuration: --config > APP_CONFIG_FILE > zcf/application.yml.\n",
+                    "An unreadable or invalid selected file prevents startup."
+                ));
+                std::process::exit(0);
+            }
+            let loader = ConfigLoader::standard()?.profile(ProfileSelection::Disabled);
+            match arguments.as_slice() {
+                [] => prepare_loader(loader),
+                [command] if command == "serve" => prepare_loader(loader),
+                [command, flag, path] if command == "serve" && flag == "--config" => {
+                    prepare_loader(loader.base_file(path)?)
+                }
+                _ => {
+                    eprintln!("usage: naxus serve [--config <application.yml>]");
+                    std::process::exit(2);
+                }
+            }
+        })
+        .clone()
 }
 
 /// 业务作用：在独占停服数据根时生成或恢复一致备份，不启动监听器或重置仓库身份。
@@ -370,6 +388,11 @@ pub fn bootstrap_loader() -> nasa::yml::strict::Result<ConfigLoader> {
 /// 返回：文件、元数据及引用全部核验成功才退出零；已有服务占用或目标存在时拒绝。
 fn backup_command(arguments: &[String]) -> Result<()> {
     use std::path::Path;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let _entered = runtime.enter();
     match arguments {
         [command, input, root, output, destination] if command == "backup" && input == "--data-dir" && output == "--output" => {
             ensure!(Path::new(root).join("naxus.sqlite3").is_file(), "source repository does not exist");
@@ -428,4 +451,139 @@ fn healthcheck(arguments: &[String]) -> Result<()> {
         .send()?;
     ensure!(response.status().is_success(), "repository is not ready");
     Ok(())
+}
+
+static PREPARED_STORE: std::sync::Mutex<Option<(PathBuf, naxus_store::PreparedStore)>> =
+    std::sync::Mutex::new(None);
+
+/// 业务作用：在 db 组件建连前取得数据卷权威，并核对数据库配置与仓库文件布局一致。
+/// 参数说明：
+/// - `loader`：已经固定文件位置与环境快照的严格配置入口。
+///
+/// 返回：保留原配置入口；不满足持久化合同或实例冲突时在任何数据库连接前拒绝。
+fn prepare_loader(loader: ConfigLoader) -> nasa::yml::strict::Result<ConfigLoader> {
+    use nasa::yml::strict::{ConfigError, ConfigPath, ErrorKind};
+    let loaded = loader.load()?;
+    let config: Config = loaded.bind_at(&ConfigPath::parse("naxus")?)?;
+    let result = (|| -> Result<()> {
+        config.validate(
+            loaded
+                .tree()
+                .pointer("/server/host")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("127.0.0.1"),
+        )?;
+        validate_datasource(loaded.tree(), &config)?;
+        let root = config.data_root()?;
+        let prepared = naxus_store::Store::prepare(&root, store_options(&config))?;
+        let mut slot = PREPARED_STORE
+            .lock()
+            .map_err(|_| anyhow::anyhow!("repository preparation unavailable"))?;
+        ensure!(slot.is_none(), "repository preparation already exists");
+        *slot = Some((root.canonicalize()?, prepared));
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("naxus storage preparation: {error:#}");
+        return Err(ConfigError::new(ErrorKind::Validation));
+    }
+    Ok(loader)
+}
+
+/// 业务作用：约束受管数据源和对象根保持同一持久身份，避免元数据与文件落在不同目录。
+/// 参数说明：
+/// - `tree`：宿主使用的完整配置。
+/// - `config`：仓库业务配置。
+///
+/// 返回：路径、driver、同步和连接策略符合仓库合同才成功。
+pub(crate) fn validate_datasource(tree: &serde_json::Value, config: &Config) -> Result<()> {
+    let source = tree
+        .pointer("/datasources/naxus")
+        .context("datasources.naxus must configure the repository SQLite datasource")?;
+    ensure!(
+        source.get("driver").and_then(serde_json::Value::as_str) == Some("sqlite"),
+        "repository datasource driver must be sqlite"
+    );
+    let path = source
+        .pointer("/sqlite/path")
+        .and_then(serde_json::Value::as_str)
+        .context("datasources.naxus.sqlite.path is required")?;
+    let expected = std::path::absolute(config.data_root()?.join("naxus.sqlite3"))?;
+    ensure!(
+        std::path::absolute(path)? == expected,
+        "repository datasource path must be naxus.data.root/naxus.sqlite3"
+    );
+    ensure!(
+        source
+            .pointer("/sqlite/journal_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("wal")
+            == "wal",
+        "repository requires WAL journal mode"
+    );
+    ensure!(
+        source
+            .pointer("/sqlite/synchronous")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("full")
+            == "full",
+        "repository requires FULL synchronous mode"
+    );
+    ensure!(
+        source
+            .pointer("/sqlite/foreign_keys")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        "repository requires foreign keys"
+    );
+    ensure!(
+        !source
+            .pointer("/sqlite/read_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        "repository requires a writable datasource"
+    );
+    ensure!(
+        source
+            .get("max_connections")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1),
+        "repository requires one metadata connection"
+    );
+    Ok(())
+}
+
+/// 业务作用：将仓库容量设置传给存储层，保留制品与元数据的持久化预算。
+/// 参数说明：
+/// - `config`：已验证的业务配置。
+///
+/// 返回：使用显式值或既有默认值的存储预算。
+fn store_options(config: &Config) -> naxus_store::StoreOptions {
+    naxus_store::StoreOptions {
+        max_artifact_bytes: config.data.max_artifact_bytes.unwrap_or(256 * 1024 * 1024),
+        reserve_free_bytes: config
+            .data
+            .hard_free_bytes
+            .unwrap_or(2 * 1024 * 1024 * 1024),
+        ..Default::default()
+    }
+}
+
+/// 业务作用：把启动前取得的唯一实例权威交给初始化，配置变化时拒绝绑定另一个数据根。
+/// 参数说明：
+/// - `config`：Application 最终装配的业务配置。
+///
+/// 返回：只交付一次的准备对象；缺失或根目录变化时失败。
+pub(crate) fn take_prepared(config: &Config) -> Result<naxus_store::PreparedStore> {
+    let mut slot = PREPARED_STORE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("repository preparation unavailable"))?;
+    let (root, prepared) = slot
+        .take()
+        .context("repository must use bootstrap_loader before db startup")?;
+    ensure!(
+        root == config.data_root()?.canonicalize()?,
+        "repository root changed during startup"
+    );
+    Ok(prepared)
 }

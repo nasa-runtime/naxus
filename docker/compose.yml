@@ -11,6 +11,7 @@ services:
     volumes:
       - naxus-data:/var/lib/naxus
       - naxus-logs:/usr/local/logs/naxus
+      - /etc/localtime:/etc/localtime:ro
     stop_grace_period: 75s
     init: false
     logging:

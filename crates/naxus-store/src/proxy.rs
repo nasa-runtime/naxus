@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, io::Read};
 
+use crate::database::{params, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Result};
 use naxus_core::{ArtifactDigest, IndexEntry};
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,11 +36,12 @@ impl Store {
         );
         let connection = self.connection()?;
         let id: String = connection.query_row(
-            "SELECT id FROM proxy_repositories WHERE id = ?1 OR name = ?1",
+            crate::statements::Statement::ProxyProxyCatalogQueryProxyRepositories,
             [proxy],
             |row| row.get(0),
         )?;
-        let mut statement = connection.prepare("SELECT c.name, c.version, c.digest, p.digest IS NOT NULL AND o.state = 'present' FROM proxy_coordinates c LEFT JOIN proxy_objects p ON p.proxy_id = c.proxy_id AND p.digest = c.digest LEFT JOIN objects o ON o.sha256 = c.digest WHERE c.proxy_id = ?1 AND c.name || '@' || c.version > ?2 ORDER BY c.name || '@' || c.version LIMIT 201")?;
+        let mut statement = connection
+            .prepare(crate::statements::Statement::ProxyProxyCatalogQueryProxyCoordinates)?;
         let mut rows = statement
             .query_map(params![id, after], |row| {
                 Ok(serde_json::json!({
@@ -50,7 +51,7 @@ impl Store {
                     "cached": row.get::<_, bool>(3)?
                 }))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         let more = rows.len() > 200;
         rows.truncate(200);
         let next = if more {
@@ -83,7 +84,7 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
-                "SELECT id, name, logical_index FROM proxy_repositories WHERE name = ?1",
+                crate::statements::Statement::ProxyCreateProxyQueryProxyRepositories,
                 [name],
                 |row| {
                     Ok(ProxyInfo {
@@ -108,7 +109,7 @@ impl Store {
             logical_index: logical_index.to_owned(),
         };
         transaction.execute(
-            "INSERT INTO proxy_repositories(id, name, logical_index) VALUES (?1, ?2, ?3)",
+            crate::statements::Statement::ProxyCreateProxyInsertProxyRepositories,
             params![proxy.id, proxy.name, proxy.logical_index],
         )?;
         transaction.commit()?;
@@ -121,17 +122,17 @@ impl Store {
     /// 返回：按名称排序的稳定身份，不包含上游地址和凭据。
     pub fn proxies(&self) -> Result<Vec<ProxyInfo>> {
         let connection = self.connection()?;
-        let mut statement = connection
-            .prepare("SELECT id, name, logical_index FROM proxy_repositories ORDER BY name")?;
+        let mut statement =
+            connection.prepare(crate::statements::Statement::ProxyProxiesQueryProxyRepositories)?;
         let proxies = statement
-            .query_map([], |row| {
+            .query_map(crate::database::params![], |row| {
                 Ok(ProxyInfo {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     logical_index: row.get(2)?,
                 })
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<sqlx::Result<Vec<_>>>()?;
         Ok(proxies)
     }
 
@@ -143,10 +144,9 @@ impl Store {
     /// 返回：已有原始 JSONL 及刷新时间，未保存返回 None。
     pub fn proxy_index(&self, proxy: &str, name: &str) -> Result<Option<ProxyIndex>> {
         let connection = self.connection()?;
-        Ok(connection
+        connection
             .query_row(
-                "SELECT body, checked_at FROM proxy_indexes
-             WHERE proxy_id = (SELECT id FROM proxy_repositories WHERE name = ?1) AND name = ?2",
+                crate::statements::Statement::ProxyProxyIndexQueryProxyIndexes,
                 params![proxy, name],
                 |row| {
                     Ok(ProxyIndex {
@@ -155,7 +155,7 @@ impl Store {
                     })
                 },
             )
-            .optional()?)
+            .optional()
     }
 
     /// 业务作用：原子保存上游原始索引与坐标摘要，拒绝同源镜像提供互相矛盾的制品。
@@ -200,21 +200,33 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id: String = transaction.query_row(
-            "SELECT id FROM proxy_repositories WHERE name = ?1",
+            crate::statements::Statement::ProxySaveProxyIndexQueryProxyRepositories,
             [proxy],
             |row| row.get(0),
         )?;
         for entry in entries {
-            let old: Option<String> = transaction.query_row("SELECT digest FROM proxy_coordinates WHERE proxy_id = ?1 AND name = ?2 AND version = ?3", params![id, name, entry.vers], |row| row.get(0)).optional()?;
+            let old: Option<String> = transaction
+                .query_row(
+                    crate::statements::Statement::ProxySaveProxyIndexQueryProxyCoordinates,
+                    params![id, name, entry.vers],
+                    |row| row.get(0),
+                )
+                .optional()?;
             // 公开镜像承诺同版本原始字节不变；不能把上游矛盾当作可覆盖的私有修订。
             ensure!(
                 old.as_deref()
                     .is_none_or(|digest| digest == entry.cksum.as_str()),
                 "upstream checksum conflict"
             );
-            transaction.execute("INSERT OR IGNORE INTO proxy_coordinates(proxy_id, name, version, digest) VALUES (?1, ?2, ?3, ?4)", params![id, name, entry.vers, entry.cksum.as_str()])?;
+            transaction.execute(
+                crate::statements::Statement::ProxySaveProxyIndexInsertProxyCoordinates,
+                params![id, name, entry.vers, entry.cksum.as_str()],
+            )?;
         }
-        transaction.execute("INSERT INTO proxy_indexes(proxy_id, name, body, checked_at) VALUES (?1, ?2, ?3, unixepoch()) ON CONFLICT(proxy_id, name) DO UPDATE SET body = excluded.body, checked_at = excluded.checked_at", params![id, name, body])?;
+        transaction.execute(
+            crate::statements::Statement::ProxySaveProxyIndexInsertProxyIndexes,
+            params![id, name, body],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -232,7 +244,14 @@ impl Store {
         name: &str,
         version: &str,
     ) -> Result<Option<ArtifactDigest>> {
-        let digest: Option<String> = self.connection()?.query_row("SELECT digest FROM proxy_coordinates WHERE proxy_id = (SELECT id FROM proxy_repositories WHERE name = ?1) AND name = ?2 AND version = ?3", params![proxy, name, version], |row| row.get(0)).optional()?;
+        let digest: Option<String> = self
+            .connection()?
+            .query_row(
+                crate::statements::Statement::ProxyProxyDigestQueryProxyCoordinates,
+                params![proxy, name, version],
+                |row| row.get(0),
+            )
+            .optional()?;
         digest.map(|digest| digest.parse()).transpose()
     }
 
@@ -243,7 +262,11 @@ impl Store {
     ///
     /// 返回：已持久登记的对象关联是否存在。
     pub fn proxy_has_object(&self, proxy: &str, digest: &ArtifactDigest) -> Result<bool> {
-        Ok(self.connection()?.query_row("SELECT EXISTS(SELECT 1 FROM proxy_objects WHERE proxy_id = (SELECT id FROM proxy_repositories WHERE name = ?1) AND digest = ?2)", params![proxy, digest.as_str()], |row| row.get(0))?)
+        self.connection()?.query_row(
+            crate::statements::Statement::ProxyProxyHasObjectQueryProxyObjects,
+            params![proxy, digest.as_str()],
+            |row| row.get(0),
+        )
     }
 
     /// 业务作用：下载并校验完整包体后登记来源引用，失败不产生可下载的代理对象。
@@ -267,7 +290,7 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state: String = transaction.query_row(
-            "SELECT state FROM objects WHERE sha256 = ?1",
+            crate::statements::Statement::ProxyInstallProxyObjectQueryObjects,
             [digest.as_str()],
             |row| row.get(0),
         )?;
@@ -276,10 +299,13 @@ impl Store {
             "object is being deleted or is unavailable"
         );
         transaction.execute(
-            "INSERT OR IGNORE INTO objects(sha256, size) VALUES (?1, ?2)",
+            crate::statements::Statement::ProxyInstallProxyObjectInsertObjects,
             params![digest.as_str(), object.size],
         )?;
-        transaction.execute("INSERT OR IGNORE INTO proxy_objects(proxy_id, digest) SELECT id, ?2 FROM proxy_repositories WHERE name = ?1", params![proxy, digest.as_str()])?;
+        transaction.execute(
+            crate::statements::Statement::ProxyInstallProxyObjectInsertProxyObjects,
+            params![proxy, digest.as_str()],
+        )?;
         transaction.commit()?;
         Ok(())
     }

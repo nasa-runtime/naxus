@@ -1,10 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::database::{params, Connection, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Context, Result};
 use naxus_core::{
     canonical_name, IndexEntry, Snapshot, MAX_BATCH_ITEMS, MAX_PUBLICATION_METADATA_BYTES,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,11 +46,17 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (repository_id, head): (String, String) = transaction.query_row(
-            "SELECT id, head FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::BatchesBeginBatchQueryRepositories,
             [repository],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let existing: Option<String> = transaction.query_row("SELECT id FROM publish_batches WHERE repository_id = ?1 AND actor = ?2 AND idempotency_key = ?3", params![repository_id, actor, key], |row| row.get(0)).optional()?;
+        let existing: Option<String> = transaction
+            .query_row(
+                crate::statements::Statement::BatchesBeginBatchQueryPublishBatches,
+                params![repository_id, actor, key],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(id) = existing {
             let batch = read_batch(&transaction, &id)?;
             ensure!(
@@ -65,14 +71,31 @@ impl Store {
             head == expected_head,
             crate::RepositoryFailure::Conflict("repository HEAD changed".to_owned())
         );
-        transaction.execute("UPDATE publish_batches SET state = 'expired' WHERE state = 'open' AND expires_at <= ?1", [now()?])?;
-        let active: u64 = transaction.query_row("SELECT COUNT(*) FROM publish_batches WHERE actor = ?1 AND state IN ('open', 'validating')", [actor], |row| row.get(0))?;
+        transaction.execute(
+            crate::statements::Statement::BatchesBeginBatchUpdatePublishBatches,
+            [now()?],
+        )?;
+        let active: u64 = transaction.query_row(
+            crate::statements::Statement::BatchesBeginBatchQueryPublishBatches2,
+            [actor],
+            |row| row.get(0),
+        )?;
         ensure!(
             active < 64,
             crate::ResourceLimitExceeded("publish batch budget exceeded")
         );
         let id = Uuid::new_v4().to_string();
-        transaction.execute("INSERT INTO publish_batches(id, repository_id, actor, idempotency_key, expected_head, state, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)", params![id, repository_id, actor, key, expected_head, now()?.saturating_add(3600)])?;
+        transaction.execute(
+            crate::statements::Statement::BatchesBeginBatchInsertPublishBatches,
+            params![
+                id,
+                repository_id,
+                actor,
+                key,
+                expected_head,
+                now()?.saturating_add(3600)
+            ],
+        )?;
         let batch = read_batch(&transaction, &id)?;
         transaction.commit()?;
         Ok(batch)
@@ -89,7 +112,7 @@ impl Store {
         let connection = self.connection()?;
         let batch = read_batch(&connection, id)?;
         let repository_id: String = connection.query_row(
-            "SELECT id FROM repositories WHERE name = ?1 OR id = ?1",
+            crate::statements::Statement::BatchesBatchQueryRepositories,
             [repository],
             |row| row.get(0),
         )?;
@@ -147,7 +170,7 @@ impl Store {
         );
         let encoded = serde_json::to_string(entry)?;
         let bytes: u64 = transaction.query_row(
-            "SELECT COALESCE(SUM(length(CAST(entry_json AS BLOB))), 0) FROM batch_items WHERE batch_id = ?1",
+            crate::statements::Statement::BatchesAddBatchItemQueryBatchItems,
             [id],
             |row| row.get(0),
         )?;
@@ -158,7 +181,7 @@ impl Store {
             crate::PublishBatchTooLarge::MetadataBytes
         );
         transaction.execute(
-            "INSERT INTO batch_items(batch_id, name, version, entry_json) VALUES (?1, ?2, ?3, ?4)",
+            crate::statements::Statement::BatchesAddBatchItemInsertBatchItems,
             params![id, entry.name, entry.vers, encoded],
         )?;
         transaction.commit()?;
@@ -206,7 +229,10 @@ impl Store {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // 封闭上传与读取最终条目共用写事务，不能提交封闭前取得的旧条目集合。
-            let changed = transaction.execute("UPDATE publish_batches SET state = 'validating' WHERE id = ?1 AND state = 'open' AND expires_at > ?2", params![id, now()?])?;
+            let changed = transaction.execute(
+                crate::statements::Statement::BatchesCommitBatchAuthorizedUpdatePublishBatches,
+                params![id, now()?],
+            )?;
             batch = read_batch(&transaction, id)?;
             ensure!(
                 changed == 1 && !batch.entries.is_empty(),
@@ -261,7 +287,10 @@ impl Store {
             )
         })();
         if result.is_err() {
-            self.connection()?.execute("UPDATE publish_batches SET state = 'aborted' WHERE id = ?1 AND state = 'validating'", [id])?;
+            self.connection()?.execute(
+                crate::statements::Statement::BatchesCommitBatchAuthorizedUpdatePublishBatches2,
+                [id],
+            )?;
         }
         result
     }
@@ -276,7 +305,7 @@ impl Store {
     pub fn abort_batch(&self, repository: &str, id: &str, actor: &str) -> Result<PublishBatch> {
         self.batch(repository, id, actor)?;
         self.connection()?.execute(
-            "UPDATE publish_batches SET state = 'aborted' WHERE id = ?1 AND state = 'open'",
+            crate::statements::Statement::BatchesAbortBatchUpdatePublishBatches,
             [id],
         )?;
         self.batch(repository, id, actor)
@@ -289,10 +318,13 @@ impl Store {
     pub(crate) fn recover_batches(&self) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
-            "UPDATE publish_batches SET state = 'aborted' WHERE state = 'validating'",
-            [],
+            crate::statements::Statement::BatchesRecoverBatchesUpdatePublishBatches,
+            crate::database::params![],
         )?;
-        connection.execute("UPDATE publish_batches SET state = 'expired' WHERE state = 'open' AND expires_at <= ?1", [now()?])?;
+        connection.execute(
+            crate::statements::Statement::BatchesRecoverBatchesUpdatePublishBatches2,
+            [now()?],
+        )?;
         Ok(())
     }
 }
@@ -304,20 +336,24 @@ impl Store {
 ///
 /// 返回：确定性条目顺序的批次；未知批次或损坏 JSON 返回错误。
 fn read_batch(connection: &Connection, id: &str) -> Result<PublishBatch> {
-    let mut batch = connection.query_row("SELECT repository_id, actor, expected_head, state, snapshot_id, expires_at FROM publish_batches WHERE id = ?1", [id], |row| {
-        Ok(PublishBatch {
-            id: id.to_owned(),
-            repository_id: row.get(0)?,
-            actor: row.get(1)?,
-            expected_head: row.get(2)?,
-            state: row.get(3)?,
-            snapshot_id: row.get(4)?,
-            expires_at: row.get(5)?,
-            entries: Vec::new(),
-        })
-    })?;
-    let mut statement = connection
-        .prepare("SELECT entry_json FROM batch_items WHERE batch_id = ?1 ORDER BY name, version")?;
+    let mut batch = connection.query_row(
+        crate::statements::Statement::BatchesReadBatchQueryPublishBatches,
+        [id],
+        |row| {
+            Ok(PublishBatch {
+                id: id.to_owned(),
+                repository_id: row.get(0)?,
+                actor: row.get(1)?,
+                expected_head: row.get(2)?,
+                state: row.get(3)?,
+                snapshot_id: row.get(4)?,
+                expires_at: row.get(5)?,
+                entries: Vec::new(),
+            })
+        },
+    )?;
+    let mut statement =
+        connection.prepare(crate::statements::Statement::BatchesReadBatchQueryBatchItems)?;
     let rows = statement.query_map([id], |row| row.get::<_, String>(0))?;
     for row in rows {
         batch.entries.push(serde_json::from_str(&row?)?);

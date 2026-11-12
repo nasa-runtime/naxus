@@ -50,6 +50,6 @@
 
 ## 来源与平台边界
 
-受管工作区不接受 Git 依赖、`[patch]`、`[replace]`、Cargo 配置 `include`、`--config`、`--lockfile-path` 或 `-Z` 来源与锁文件覆盖。path 依赖只支持同一工作区成员；其他独立项目先发布到 Naxus。
+受管工作区不接受 Git 依赖、`[patch]`、`[replace]`、Cargo 配置 `include`、`--config`、`--lockfile-path` 或 `-Z` 来源与锁文件覆盖。本地包依赖只支持同一工作区成员；其他独立项目先发布到 Naxus。
 
 客户端仅支持满足本地锁和目录同步合同的 Linux/macOS 文件系统。远程私服使用 HTTPS，回环入口允许 HTTP；不支持 Windows、任意本地源码跨工作区注入或服务端执行 Cargo 构建。

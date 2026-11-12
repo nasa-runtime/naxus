@@ -24,9 +24,26 @@ server:
 naxus:
   public_base_url: ${NAXUS_PUBLIC_URL:http://127.0.0.1:7443}
   data:
-    root: ${NAXUS_DATA_PATH:}
+    root: ${NAXUS_DATA_PATH:${HOME}/.naxus/repository}
   auth:
     mode: ${NAXUS_AUTH_MODE:${NAXUS_ACCESS_MODE:none}}
   repositories:
     - name: team-dev
       policy: mutable
+
+datasources:
+  naxus:
+    driver: sqlite
+    sqlite:
+      path: ${naxus.data.root}/naxus.sqlite3
+      create_if_missing: true
+      journal_mode: wal
+      synchronous: full
+      foreign_keys: true
+      busy_timeout_ms: 5000
+    max_connections: 1
+    min_connections: 1
+    transaction_timeout_ms: 300000
+    max_result_rows: 1000000
+    max_result_bytes: 268435456
+    min_free_bytes: ${naxus.data.hard_free_bytes:2147483648}

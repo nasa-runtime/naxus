@@ -36,11 +36,21 @@
 
 ## 容器无法写入或服务拒绝启动
 
+先检查 `serve --config`、`APP_CONFIG_FILE` 和进程工作目录。显式路径优先于环境变量，环境变量非空时优先于 `zcf/application.yml`；选定文件不可读或无效不会自动回退。容器中挂载完整配置目录，并让 `APP_CONFIG_FILE` 指向容器内的文件路径。文件修改后重启；环境变量修改后重建容器。
+
 数据根必须归运行账号所有，Unix 权限为 0700；默认镜像用户是 10001:10001。Docker Desktop 使用 Linux 原生 named volume。自定义 UID、宿主挂载与恢复目录的要求见[容器说明](../docker/README.md)。
 
 一个数据根只允许一个活动实例。原生数据根末级符号链接、网络文件系统、内存盘和宿主共享挂载不满足持久化合同。无法解释的对象丢失或摘要不符会阻止就绪；从完整备份恢复，不创建空文件补足引用。
 
+自定义 YAML 必须提供 `datasources.naxus`，使用 `driver: sqlite`、单连接、WAL、FULL 和外键，数据库文件必须位于同一个仓库数据根。来源缺失、只读设置或文件位置不一致都会拒绝启动，配置见[SQLite 数据源](configuration.md#sqlite-数据源)。
+
+未知结构进度、数据库完整性或外键检查失败时，不要通过手工修改进度或关闭约束继续启动。确认程序与备份的结构兼容性，按[恢复流程](operations.md#停机备份和恢复)恢复到新目录。实例冲突时先确认旧进程已完成关闭，不删除活动锁文件、WAL 或 SHM。
+
 日志目录也须可写，表达式为 `${NAXUS_LOG_PATH:/usr/local/logs/${application.name}}`。本机用户设置 NAXUS_LOG_PATH 为自己可写的目录。完整备份、恢复与升级流程见[运行维护](operations.md)。
+
+## 指标入口返回 404
+
+指标出口默认需要显式启用。在 `grafana.observability` 中启用观测、设置运行环境身份，并将 `prometheus.scrape.listener` 设为 `web`，重启后由服务端口提供 `/metrics`。未启用出口时该路由不存在，不代表数据库未登记观测。完整示例见[观测出口](configuration.md#观测出口)。
 
 ## 诊断信息与支持渠道
 

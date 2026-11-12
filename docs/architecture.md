@@ -1,8 +1,14 @@
 # 仓库身份、运行与持久化
 
-Naxus 通过 NASA Application 拥有一个常驻进程、一个 HTTP listener 和统一停机权威。YAML、文件日志、口令密码学、浏览器身份接口、授权快照及指标目录复用 NASA。SQLite、Cargo 协议、制品缓存、工作区编排和 Admin 状态由 Naxus 定义，不依赖外部数据库或注册中心。
+Naxus 通过 NASA Application 拥有一个常驻进程、一个 HTTP listener 和统一停机权威。YAML、文件日志、口令密码学、浏览器身份接口、授权快照及指标目录复用 NASA。元数据结构、Cargo 协议、制品缓存、工作区编排和 Admin 状态由 Naxus 定义，SQLite 来源与事务由 NASA 组件执行，不依赖外部数据库或注册中心。
 
-当前依赖的 NASA SQL 能力面向 MySQL/PostgreSQL，没有 SQLite 适配器。Naxus 使用 rusqlite 的本地连接、WAL/FULL 和 backup API，将账号权限与仓库状态保存在同一数据库事务中；本地运行和远程部署均无需另设数据库服务。
+元数据通过 `nasa::mapper::sqlite` 的 trait 接口及 `#[Mapper]`、`#[Query]`、`#[Insert]`、`#[Update]`、`#[Delete]`、`#[Execute]` 声明 SQL。NASA Application 的 `db` 组件持有 SQLite owner、连接观测与关闭责任，`natx-sqlite` 执行 WAL/FULL 事务、完整性检查、checkpoint 和原生备份。本地运行和远程部署均无需另设数据库服务。
+
+存储层保留同步文件操作边界，在有界阻塞执行域中持有对象门与元数据门。固定命令交给宿主运行时中的单一消费任务，由该任务在 NASA 环境事务内调用 Mapper；不会跨 spawn 丢失事务，也不会接受任意 SQL 文本。IMMEDIATE 事务只有确认提交后才返回成功，提前返回或异常路径请求回滚；事务总期限结束后，剩余命令被拒绝，不能变成独立写入。
+
+`bootstrap_loader` 在数据库建连前取得数据根实例锁并收紧旧文件权限；初始化阶段在同一受管来源上执行结构升级、恢复及引用校验，随后才开放路由。结构 SQL 也由 Mapper trait 声明，每步结构与 `metadata` 中的 `schema_revision` 键同事务提交。已有库兼容 `user_version` 的进度标识，未知进度、结构或外键异常均阻断启动。
+
+实例锁由 SQLite 文件 owner 同时保留，只有原生连接关闭后才允许交接对象目录。初始化失败、调用取消或运行时退出不能提前解除这一约束；固定维护接口执行完整性检查、checkpoint 和备份，不向存储调用方暴露任意 PRAGMA 或原生句柄。
 
 ## 四种身份
 

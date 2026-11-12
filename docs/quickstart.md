@@ -4,12 +4,13 @@
 
 ## 安装与启动服务
 
-从源码仓库根目录安装三个程序：
+从 Naxus 源码仓库根目录构建并安装三个程序：
 
 ```sh
-cargo install --path . --locked
-cargo install --path crates/cargo-naxus --locked
-cargo install --path crates/cargo-credential-naxus --locked
+cargo build --workspace --release --locked
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/naxus target/release/cargo-naxus target/release/cargo-credential-naxus "$HOME/.local/bin/"
+export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$HOME/.local/state/naxus/logs"
 export NAXUS_LOG_PATH="$HOME/.local/state/naxus/logs"
 export NAXUS_AUTH_MODE=managed
@@ -17,6 +18,8 @@ naxus serve --config zcf/application.yml
 ```
 
 需要 Rust/Cargo 1.97 或更新版本。两个客户端程序须位于 PATH 中，服务保持前台运行。在另一个终端继续以下操作；本机数据根默认为 `~/.naxus/repository`。
+
+主配置也可通过 `APP_CONFIG_FILE=/etc/naxus/application.yml naxus serve` 选择。显式 `serve --config` 优先；两者均未设置时使用进程工作目录中的 `zcf/application.yml`。完整配置须保留 `datasources.naxus`，具体字段见[配置说明](configuration.md)。
 
 打开 `http://127.0.0.1:7443/admin/`，以 `admin` 登录。首次口令位于数据根的 `bootstrap/admin.password`；设置新口令后该临时文件被移除。已有数据根不会重新生成账号。
 

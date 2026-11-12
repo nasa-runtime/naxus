@@ -1,8 +1,8 @@
 use std::fs;
 
+use crate::database::{params, OptionalExtension, TransactionBehavior};
 use anyhow::{ensure, Result};
 use naxus_core::ArtifactDigest;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
 use crate::{objects, DeletionScope, Store};
@@ -20,30 +20,34 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: u64 = transaction.query_row(
-            "SELECT count(*) FROM object_deletions WHERE state IN ('accepted', 'running')",
-            [],
+            crate::statements::Statement::UnpublishedCollectUnpublishedQueryObjectDeletions,
+            crate::database::params![],
             |row| row.get(0),
         )?;
         if pending >= 4 {
             // 为用户明确提交的清除保留队列空间，维护不能占满所有删除权威。
             return Ok(None);
         }
-        let unmapped: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM proxy_session_entries e JOIN proxy_sessions s ON s.id = e.session_id WHERE s.expires_at > unixepoch() AND NOT EXISTS(SELECT 1 FROM proxy_session_objects o WHERE o.session_id = e.session_id AND o.name = e.name))", [], |row| row.get(0))?;
+        let unmapped: bool = transaction.query_row(
+            crate::statements::Statement::UnpublishedCollectUnpublishedQueryProxySessionEntries,
+            crate::database::params![],
+            |row| row.get(0),
+        )?;
         if unmapped {
             // 升级前尚无精确对象映射的活动视图仍然保有读取承诺，不能据此推断任何对象可回收。
             return Ok(None);
         }
-        let mut statement = transaction.prepare("SELECT o.sha256, o.generation, o.size FROM objects o WHERE o.state = 'present' AND o.installed_at <= unixepoch() - 3600 AND NOT EXISTS(SELECT 1 FROM revisions r WHERE r.sha256 = o.sha256) AND NOT EXISTS(SELECT 1 FROM proxy_objects p WHERE p.digest = o.sha256) AND NOT EXISTS(SELECT 1 FROM materialization_items i JOIN proxy_materializations m ON m.id = i.materialization_id WHERE i.digest = o.sha256 AND m.valid = 1) AND NOT EXISTS(SELECT 1 FROM batch_items i JOIN publish_batches b ON b.id = i.batch_id WHERE json_extract(i.entry_json, '$.cksum') = o.sha256 AND (b.state = 'validating' OR (b.state = 'open' AND b.expires_at > unixepoch()))) AND NOT EXISTS(SELECT 1 FROM proxy_session_objects p JOIN proxy_sessions s ON s.id = p.session_id WHERE p.digest = o.sha256 AND s.expires_at > unixepoch()) ORDER BY o.installed_at, o.sha256 LIMIT 64")?;
+        let mut statement = transaction
+            .prepare(crate::statements::Statement::UnpublishedCollectUnpublishedQueryObjects)?;
         let candidates = statement
-            .query_map([], |row| {
+            .query_map(crate::database::params![], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, u64>(2)?,
                 ))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
+            .collect::<sqlx::Result<Vec<_>>>()?;
         let readers = self
             .readers
             .lock()
@@ -76,12 +80,27 @@ impl Store {
             revoke_history: false,
         };
         // 只有完整数据库引用复验后才提交清理权；文件动作继续复用代次隔离和崩溃恢复。
-        transaction.execute("INSERT INTO object_deletions(id, actor, scope, state) VALUES (?1, 'maintenance', ?2, 'accepted')", params![id, serde_json::to_string(&scope)?])?;
+        transaction.execute(
+            crate::statements::Statement::UnpublishedCollectUnpublishedInsertObjectDeletions,
+            params![id, serde_json::to_string(&scope)?],
+        )?;
         for (digest, generation, size) in selected {
-            ensure!(transaction.execute("UPDATE objects SET state = 'deleting' WHERE sha256 = ?1 AND generation = ?2 AND state = 'present'", params![digest.as_str(), generation])? == 1, "unpublished object authority changed");
-            transaction.execute("INSERT INTO deletion_items(deletion_id, digest, generation, size, state) VALUES (?1, ?2, ?3, ?4, 'deleting')", params![id, digest.as_str(), generation, size])?;
+            ensure!(
+                transaction.execute(
+                    crate::statements::Statement::UnpublishedCollectUnpublishedUpdateObjects,
+                    params![digest.as_str(), generation]
+                )? == 1,
+                "unpublished object authority changed"
+            );
+            transaction.execute(
+                crate::statements::Statement::UnpublishedCollectUnpublishedInsertDeletionItems,
+                params![id, digest.as_str(), generation, size],
+            )?;
         }
-        transaction.execute("INSERT INTO security_audit(actor, action, target) VALUES ('maintenance', 'collect-unpublished', ?1)", [&id])?;
+        transaction.execute(
+            crate::statements::Statement::UnpublishedCollectUnpublishedInsertSecurityAudit,
+            [&id],
+        )?;
         transaction.commit()?;
         Ok(Some(id))
     }
@@ -105,7 +124,7 @@ impl Store {
             );
             let known: Option<(u64, String)> = connection
                 .query_row(
-                    "SELECT size, state FROM objects WHERE sha256 = ?1",
+                    crate::statements::Statement::UnpublishedRecoverUnpublishedQueryObjects,
                     [digest.as_str()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -113,14 +132,17 @@ impl Store {
             if known.is_none() {
                 let object = objects::verify_object(&self.root, &digest, None)?;
                 connection.execute(
-                    "INSERT INTO objects(sha256, size, installed_at) VALUES (?1, ?2, unixepoch())",
+                    crate::statements::Statement::UnpublishedRecoverUnpublishedInsertObjects,
                     params![digest.as_str(), object.size],
                 )?;
             } else if let Some((size, state)) = known {
                 if state == "purged" {
                     objects::verify_object(&self.root, &digest, Some(size))?;
                     // 同摘要重装已完成文件同步但未登记时，恢复新的代次；旧修订撤销记录保持原值。
-                    connection.execute("UPDATE objects SET generation = generation + 1, state = 'present', installed_at = unixepoch() WHERE sha256 = ?1 AND state = 'purged'", [digest.as_str()])?;
+                    connection.execute(
+                        crate::statements::Statement::UnpublishedRecoverUnpublishedUpdateObjects,
+                        [digest.as_str()],
+                    )?;
                 }
             }
         }
